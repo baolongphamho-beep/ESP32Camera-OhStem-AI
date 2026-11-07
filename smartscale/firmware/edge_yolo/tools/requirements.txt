@@ -1,0 +1,10 @@
+# Isolated export environment, matching the official ESP-DL YOLO26 tutorial.
+esp-ppq==1.2.10
+onnx==1.17.0
+onnxruntime>=1.19.0
+torch==2.5.1
+torchvision==0.20.1
+numpy==1.26.4
+ultralytics==8.4.7
+opencv-python==4.11.0.86
+onnxsim==0.4.36
