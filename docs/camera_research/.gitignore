@@ -1,0 +1,20 @@
+# Môi trường ảo Python
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# File chứa thông tin nhạy cảm (bỏ dấu # nếu muốn giấu không đẩy lên GitHub)
+# camera_secrets.txt
+
+# File tạm IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+
+camera_secrets.txt
+.env
+.env.*
+!.env.example
+*.log

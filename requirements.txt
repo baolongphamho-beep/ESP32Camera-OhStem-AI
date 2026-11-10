@@ -1,0 +1,17 @@
+# ==============================================================================
+# SmartScale Python Dependencies (Camera, USB Viewer, and Verification)
+# ==============================================================================
+# To install in your virtual environment (.venv):
+#   python -m venv .venv
+#   .\.venv\Scripts\activate
+#   pip install -r requirements.txt
+# ==============================================================================
+
+# Core utilities for USB viewer and camera streaming
+opencv-python>=4.10.0,<5.0.0
+numpy>=1.24.0,<3.0.0
+pyserial>=3.5
+requests>=2.32.0,<3.0.0
+
+# YOLO detection model (needed for Pipeline 2 laptop AI mode)
+ultralytics>=8.3.0
