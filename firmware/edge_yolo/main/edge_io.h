@@ -22,6 +22,8 @@ void edgeIoInit();
 EdgeConfig configSnapshot();
 void saveFocalIfUnchanged(const EdgeConfig& original, float focal);
 bool wifiReady();
+void wifiIp(char* out, size_t size); // UNO's own IPv4, or "no IP".
+void bleSetCapturePriority(bool capturing);
 void cameraState(PersonStatus status, float height = 0, float distance = 0);
 MeasurementView stateSnapshot();
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata);

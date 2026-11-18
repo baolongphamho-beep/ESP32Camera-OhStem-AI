@@ -129,8 +129,9 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ---
 
-## 5. Sơ Đồ Đấu Nối Phần Cứng
+## 5. Sơ Đồ Đấu Nối Phần Cứng (Netlist) & Cài Đặt Camera AI
 
+### 5.1. Đấu nối phần cứng theo Netlist
 Trước khi cấp điện, hãy nối dây các module theo sơ đồ chuẩn dưới đây:
 
 ```
@@ -139,27 +140,27 @@ Trước khi cấp điện, hãy nối dây các module theo sơ đồ chuẩn d
 └─────────────────────────────────────────────────────────────────────────────┘
 
        [ Cân Mi Scale 2 ]                    [ Camera OhStem AI ]
-        (Đặt trên sàn)                       (Gắn thẳng góc người đứng)
+        (Đặt trên sàn)                       (Chế độ: 6. Stream video)
               │                                      │
-              │ Sóng Bluetooth BLE (0x181D)          │ Phát luồng Wi-Fi JPEG
+              │ Sóng Bluetooth BLE (0x181D)          │ Phát luồng Wi-Fi JPEG (/capture)
               ▼                                      ▼
        ┌──────────────────────────────────────────────────────┐
        │               Bo Mạch YOLO UNO (ESP32-S3)            │
        │                                                      │
        │   - Xử lý BLE đọc cân nặng                           │
-       │   - Thu ảnh Wi-Fi từ Camera                          │
-       │   - Chạy mạng AI YOLO26n INT8 suy luận chiều cao     │
+       │   - Thu ảnh Wi-Fi từ Camera (Core 0 song song)       │
+       │   - Chạy mạng AI YOLO26n INT8 suy luận (Core 1)      │
        │   - Ghép cặp đo và tính chỉ số BMI                   │
        └──────────────────────────┬───────────────────────────┘
                                   │
                                   │ Giao tiếp I2C (Cổng I2C màu đỏ)
                                   ▼
                        [ Màn hình LCD 16×2 ]
-                          Dòng 1: Cân nặng & Chiều cao
-                          Dòng 2: Trạng thái & Chỉ số BMI
+                          SDA -> GPIO 11 | SCL -> GPIO 12
+                          VCC -> 5V      | GND -> GND
 ```
 
-### Bảng chân cắm chi tiết trên bo YOLO UNO
+#### Bảng chân cắm chi tiết (Netlist) trên bo YOLO UNO
 
 | Linh kiện | Chân linh kiện | Chân trên YOLO UNO | Chức năng | Ghi chú |
 |---|---|---|---|---|
@@ -167,65 +168,86 @@ Trước khi cấp điện, hãy nối dây các module theo sơ đồ chuẩn d
 | | **SCL** | **GPIO 12** | Tín hiệu xung nhịp I2C | Dùng cổng I2C màu đỏ trên YOLO UNO |
 | | **VCC** | **5V** | Nguồn nuôi 5V | |
 | | **GND** | **GND** | Chân mass chung | Phải chung GND với hệ thống |
-| **Camera OhStem** | **Type-C** | Củ sạc 5V riêng | Cấp nguồn cho Camera | Cần nguồn tối thiểu 5V-1A riêng |
+| **Camera OhStem** | **Type-C** | Củ sạc 5V riêng | Cấp nguồn cho Camera | Cần nguồn tối thiểu 5V-1A ổn định |
 | | **Wi-Fi** | Wi-Fi chung với UNO | Truyền hình ảnh JPEG | Cùng mạng Wi-Fi 2.4GHz |
-| **Cân Mi Scale 2** | Pin 4x AAA | Không dây (BLE) | Kết nối BLE tự động | Bo tự quét MAC cân (`70:87:9E:EA:3A:E0`) |
-| **YOLO UNO** | **Type-C** | Cổng Type-C Laptop | Nạp firmware & Cấu hình | Cắm vào laptop khi nạp / cấu hình |
+| | **TX / RX (Grove)** | **GPIO 9 (D6) / GPIO 8 (D5)** | Cổng Grove UART | Chỉ cần nếu chạy Pipeline 2 (UART) |
+| **Cân Mi Scale 2** | Pin 4x AAA | Không dây (BLE) | Kết nối BLE tự động | Bo tự quét gói `0x181D` (MAC `70:87:9E:EA:3A:E0`) |
+| **YOLO UNO** | **Type-C** | Cổng Type-C Laptop | Nạp firmware & Cấu hình | Dùng cáp Type-C có truyền dữ liệu |
 
 ---
 
-## 6. Biên Dịch & Nạp Firmware Xuống Bo Mạch YOLO UNO
+### 5.2. Chuyển Camera AI vào chế độ "Stream video" & Setup lại Wi-Fi cho Camera
+> [!IMPORTANT]
+> Endpoint lấy ảnh `/capture` của Camera AI OhStem **chỉ hoạt động khi camera đang ở chế độ `Stream video`**. Bạn có thể thực hiện bước này **song song** trong lúc chờ máy tính biên dịch và nạp firmware cho YOLO UNO ở Mục 6.
 
-Dự án đã tích hợp sẵn mô hình lượng tử hóa **`yolo26n_224_s8_s3.espdl`** trực tiếp trong Git, bạn **không cần** phải huấn luyện hay lượng tử hóa lại từ đầu!
+1. **Vào chế độ Stream video:**
+   - Cấp nguồn 5V cho Camera AI OhStem.
+   - Quan sát màn hình OLED 2.0 inch phía sau lưng camera, dùng nút bấm vật lý trên camera để di chuyển trong menu (`SELECT AI MODEL / CHỌN CHỨC NĂNG`) và chọn mục **`6. Stream video`**.
+2. **Setup lại Wi-Fi cho Camera (khi đổi mạng Wi-Fi hoặc dùng lần đầu):**
+   - Nếu camera chưa kết nối được Wi-Fi đã lưu, camera sẽ tự phát một mạng Wi-Fi riêng (Access Point) có tên dạng **`ohstemcam_...`** hoặc **`ohstem-ai-camera-xxxxx`**.
+   - Dùng điện thoại hoặc laptop kết nối vào mạng Wi-Fi `ohstemcam_...` đó.
+   - Mở trình duyệt web và truy cập địa chỉ: **`http://192.168.4.1`** (trang *Cấu hình Wi-Fi*).
+   - Chọn tên mạng **Wi-Fi 2.4 GHz** (cùng mạng sẽ dùng cho YOLO UNO), nhập mật khẩu và nhấn **KẾT NỐI**.
+3. **Kiểm tra địa chỉ IP trên màn hình Camera:**
+   - Sau khi kết nối Wi-Fi thành công, màn hình OLED phía sau camera sẽ hiển thị **địa chỉ IP** được cấp (ví dụ: `10.127.7.68` hoặc `192.168.1.150`) kèm dòng nhắc *Open this on PC or phone same WiFi*.
+   - **Lưu ý quan trọng:** Hãy **đóng tất cả các tab trình duyệt** đang mở địa chỉ IP của camera trước khi chạy YOLO UNO, vì web server trên camera chỉ phục vụ 1 kết nối tại một thời điểm (nếu mở trình duyệt song song, camera sẽ trả về `{"busy":1}`).
 
-### Bước 6.1: Xác định cổng COM của bo mạch
+---
+
+## 6. (Làm Song Song) Biên Dịch & Nạp Firmware Xuống Bo Mạch YOLO UNO
+
+Dự án đã tích hợp sẵn mô hình lượng tử hóa **`yolo26n_224_s8_s3.espdl`** trực tiếp trong Git, và script `build.ps1` sẽ **tự động tải thư viện `esp-dl`** cũng như cập nhật đường dẫn `dependencies.lock` trong lần đầu chạy trên PC mới.
+
+### Bước 6.1: Xác định cổng COM của bo mạch YOLO UNO
 1. Cắm cáp USB Type-C từ bo YOLO UNO vào laptop.
 2. Mở **Device Manager** trên Windows (nhấn `Win + X` $\rightarrow$ chọn `Device Manager`).
-3. Mở rộng mục **Ports (COM & LPT)**, tìm tên cổng kết nối, ví dụ:
-   - `USB-Enhanced-SERIAL CH340 (COM9)` $\rightarrow$ Cổng của bạn là `COM9`.
+3. Mở rộng mục **Ports (COM & LPT)**, tìm số cổng COM của YOLO UNO (ví dụ `USB Serial Device (COM13)` hoặc `COM9`).
 
 ### Bước 6.2: Chạy script tự động biên dịch và nạp (1 chạm)
 Mở PowerShell tại thư mục dự án và chạy:
 
 ```powershell
-# Thay COM9 bằng cổng COM thực tế trên máy bạn
-powershell -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM9
+# Thay COM13 bằng cổng COM thực tế trên máy bạn
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM13
 ```
 
 > [!NOTE]
-> - Script `build.ps1` sẽ tự động tìm kiếm bộ cài đặt ESP-IDF tại `C:\Espressif` hoặc `D:\Workspace\Espressif`.
+> - Script `build.ps1` tự động tìm bộ cài đặt ESP-IDF tại `C:\Espressif` hoặc `D:\Workspace\Espressif` và tự tải `.edge-deps/esp-dl` nếu máy mới chưa có.
 > - Quá trình biên dịch lần đầu tiên mất khoảng 2 - 4 phút.
-> - Sau khi biên dịch xong, script sẽ tự động nạp bootloader, bảng phân vùng và nạp file model AI vào phân vùng `model` (địa chỉ `0x810000`).
-> - Khi hoàn tất, màn hình sẽ thông báo `Hash of data verified. Leaving... Staying in monitor or reset`.
+> - Sau khi biên dịch xong, script tự động nạp bootloader, bảng phân vùng và firmware chứa model AI xuống bo.
 
 ---
 
-## 7. Cấu Hình Wi-Fi & Camera Qua Cáp USB (USB Viewer)
+## 7. Chạy Chương Trình, Configure Lại & Vận Hành (USB Viewer)
 
-Sau khi nạp firmware, bạn cần cung cấp thông tin Wi-Fi và địa chỉ Camera để bo mạch kết nối.
+Sau khi đã có IP trên màn hình Camera AI (Mục 5.2) và nạp xong firmware cho YOLO UNO (Mục 6), bạn tiến hành cấu hình và chạy chương trình:
 
-### Bước 7.1: Mở công cụ cấu hình
-Vẫn giữ cáp USB nối với máy tính, chạy lệnh:
+### Bước 7.1: Chạy chương trình kèm `--configure` để thiết lập thông số
+Vẫn giữ cáp USB nối với máy tính, kích hoạt môi trường `.venv` và chạy lệnh:
 
 ```powershell
-python camera/usb_viewer.py --port COM9 --configure
+python camera/usb_viewer.py --port COM13 --configure
 ```
+*(Thay `COM13` bằng cổng COM của bạn).*
 
-### Bước 7.2: Nhập thông số mạng
-Chương trình sẽ hỏi tương tác qua giao diện dòng lệnh:
-1. **Wi-Fi SSID:** Nhập tên mạng Wi-Fi 2.4GHz của bạn (ví dụ: `Lab_Robotics`).
-2. **Wi-Fi Password:** Nhập mật khẩu Wi-Fi.
-3. **Camera URL:** Nhập đường dẫn lấy ảnh của Camera OhStem (ví dụ: `http://192.168.1.150/capture` hoặc `http://10.127.7.68/capture`).
+### Bước 7.2: Nhập thông số mạng & lắp đặt
+Chương trình sẽ hỏi tương tác từng mục:
+1. **WiFi SSID:** Nhập tên mạng Wi-Fi 2.4GHz (cùng mạng với Camera AI, ví dụ `HCMUT-MEETING`).
+2. **WiFi password:** Nhập mật khẩu Wi-Fi.
+3. **URL hoặc IP camera:** Nhập địa chỉ IP hiện trên màn hình OLED của Camera AI (ví dụ gõ `10.127.7.68` hoặc `http://10.127.7.68/capture` — chương trình sẽ tự động thêm `/capture`).
+4. **Chế độ `fixed` / `ground`:**
+   - Chọn `fixed` (mặc định): Nhập khoảng cách từ camera đến vị trí đứng trên cân (m), chiều cao thật của người chuẩn đầu tiên (cm), và nhập `fy/H = 0` để mạch tự hiệu chuẩn tiêu cự ngay khung hình toàn thân đầu tiên.
+   - Hoặc chọn `ground`: Nhập độ cao tâm camera so với mặt bàn cân (cm), góc nghiêng xuống (độ) và hệ số tiêu cự `fy/H`.
 
 > [!TIP]
-> Các thông số trên sẽ được lưu vĩnh viễn vào bộ nhớ **NVS Flash** của chip ESP32-S3. Lần sau bật nguồn, bạn không cần phải cấu hình lại!
+> Ngay khi hiện **`Da luu cau hinh.`**, toàn bộ thông số được lưu vĩnh viễn vào bộ nhớ **NVS Flash** của YOLO UNO và cửa sổ xem ảnh trực tiếp sẽ mở ra ngay lập tức!
 
-### Bước 7.3: Mở màn hình quan sát ảnh thời gian thực (Tùy chọn)
-Nếu bạn muốn vừa xem camera vừa kiểm tra các bounding box AI mà chip ESP32-S3 đang xử lý, chạy lệnh:
+### Bước 7.3: Chạy chương trình ở các lần tiếp theo
+Ở những lần sử dụng sau (khi không đổi Wi-Fi hay IP camera), bạn không cần gõ `--configure` nữa mà chỉ cần chạy thẳng:
 ```powershell
-python camera/usb_viewer.py --port COM9
+python camera/usb_viewer.py --port COM13
 ```
-Màn hình OpenCV sẽ mở ra, hiển thị hình ảnh từ camera được truyền ngược về qua giao thức nhị phân USB bảo vệ bởi mã kiểm tra CRC32.
+Cửa sổ **SmartScale - YOLO UNO USB viewer** sẽ hiển thị trực tiếp video từ camera, khung xanh nhận diện người, chiều cao, khoảng cách, cân nặng, BMI và thời gian xử lý (`AI: ... ms   Net: ... ms`). Nhấn **`Q`** hoặc **`Esc`** khi muốn thoát.
 
 ---
 

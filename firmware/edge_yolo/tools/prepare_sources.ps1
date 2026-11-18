@@ -1,5 +1,11 @@
 $ErrorActionPreference = 'Stop'
-$workspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../../../..')).Path
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
+$sharedParent = try { (Resolve-Path (Join-Path $PSScriptRoot '../../../../..') -ErrorAction Stop).Path } catch { $null }
+if ($sharedParent -and (Test-Path -LiteralPath (Join-Path $sharedParent '.edge-deps/esp-dl'))) {
+    $workspaceRoot = $sharedParent
+} else {
+    $workspaceRoot = $repoRoot
+}
 $destination = Join-Path $workspaceRoot '.edge-deps/esp-dl'
 $revision = '512ed0b0dc5f5320f3d9ca5a5aea189803f87f31'
 if (!(Test-Path -LiteralPath (Join-Path $destination '.git'))) {

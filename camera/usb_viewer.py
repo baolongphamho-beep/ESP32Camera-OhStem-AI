@@ -1,6 +1,5 @@
 """View JPEGs/results from YOLO UNO. No model or inference runs on this PC."""
 import argparse
-import getpass
 import time
 
 from usb_protocol import Parser, config_commands
@@ -10,7 +9,15 @@ def open_device(name):
     import serial
     from serial.tools import list_ports
     try:
-        return serial.Serial(name, 115200, timeout=.05, write_timeout=3)
+        # Disable DTR/RTS before opening so Windows does not pulse the
+        # ESP32-S3 USB-Serial/JTAG reset circuit on open/close.
+        port = serial.Serial(None, 115200, timeout=.01, write_timeout=3, dsrdtr=False, rtscts=False)
+        port.port = name
+        port.dtr = False
+        port.rts = False
+        port.open()
+        port.reset_input_buffer()
+        return port
     except serial.SerialException as error:
         print(f"Khong mo duoc cong {name}: {error}", flush=True)
         ports = list(list_ports.comports())
@@ -41,11 +48,17 @@ def configure():
     ssid = input("WiFi SSID (Enter = giu nguyen): ").strip()
     if ssid:
         values["ssid"] = ssid
-        values["password"] = getpass.getpass("WiFi password (khong hien / khong ghi file): ")
-    url = input("URL anh camera (Enter = giu nguyen, vi du http://10.127.7.68/capture): ").strip()
+        values["password"] = input("WiFi password (khong ghi file): ")
+    url = input("URL hoac IP camera (Enter = giu nguyen, vi du http://10.127.7.68/capture): ").strip()
     if url:
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
         if not url.startswith("http://"):
             raise ValueError("Camera URL phai bat dau bang http://")
+        host_and_path = url[len("http://"):].rstrip("/")
+        if "/" not in host_and_path:
+            url = f"http://{host_and_path}/capture"
+            print(f"  -> Tu dong them /capture: {url}")
         values["camera"] = url
     mode = input("Che do fixed / ground [fixed]: ").strip().lower() or "fixed"
     if mode not in {"fixed", "ground"}:
@@ -77,48 +90,79 @@ def main():
     background = np.zeros((480, 800, 3), np.uint8)
     last_image = 0
     notice = "Waiting for YOLO UNO..."
-    with open_device(args.port) as port:
-        print(f"Da mo {args.port}.", flush=True)
-        commands = configure() if args.configure else None
-        # Do not toggle DTR/RTS: this board uses native USB Serial/JTAG.
-        if commands:
-            port.write(commands)
-        while True:
-            frames = decoder.feed(port.read(min(max(port.in_waiting, 1), 65536)))
-            for metadata, jpeg in frames:
-                kind = metadata.get("kind")
-                if kind == "config":
-                    print("Da luu cau hinh." if metadata.get("ok") else "Cau hinh bi tu choi.")
-                elif kind == "boot":
-                    print("On-board self-test:", metadata)
-                elif kind == "status":
-                    notice = metadata.get("message", "Waiting")
-                    last_image = 0
-                elif kind == "frame" and jpeg:
-                    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-                    if image is None:
-                        continue
-                    for x1, y1, x2, y2, confidence in metadata.get("boxes", []):
-                        cv2.rectangle(image, (round(x1), round(y1)), (round(x2), round(y2)), (0, 255, 0), 2)
-                    canvas = cv2.resize(image, (800, round(image.shape[0] * 800 / image.shape[1])))
-                    lines = [metadata.get("status", ""),
-                             f"Height: {metadata.get('height_cm')} cm   Distance: {metadata.get('distance_m')} m",
-                             f"Weight: {metadata.get('weight_kg')} kg {'LOCK' if metadata.get('weight_stable') else 'moving'}   BMI: {metadata.get('bmi')}",
-                             f"On-board processing: {metadata.get('processing_ms')} ms"]
-                    for i, line in enumerate(lines):
-                        cv2.putText(canvas, line, (10, 25 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
-                    background = canvas
-                    last_image = time.monotonic()
-            if not last_image or time.monotonic() - last_image > 15:
-                screen = np.zeros((480, 800, 3), np.uint8)
-                cv2.putText(screen, notice if not last_image else "No fresh frame from YOLO UNO", (12, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
-            else:
-                screen = background
-            cv2.imshow(title, screen)
-            if cv2.waitKey(1) & 0xff in (ord('q'), 27):
-                break
-    cv2.destroyAllWindows()
+    try:
+        with open_device(args.port) as port:
+            print(f"Da mo {args.port}.", flush=True)
+            commands = configure() if args.configure else None
+            # Do not toggle DTR/RTS: this board uses native USB Serial/JTAG.
+            if commands:
+                port.reset_input_buffer()
+                port.write(commands)
+            while True:
+                waiting = port.in_waiting
+                frames = decoder.feed(port.read(min(waiting, 65536))) if waiting else []
+                for metadata, jpeg in frames:
+                    kind = metadata.get("kind")
+                    if kind == "config":
+                        print("Da luu cau hinh." if metadata.get("ok") else "Cau hinh bi tu choi.")
+                        if metadata.get("ok") and not last_image:
+                            notice = "Configuration saved. Fetching camera frame..."
+                    elif kind == "boot":
+                        print("On-board self-test:", metadata)
+                    elif kind == "status":
+                        message = metadata.get("message", "Waiting")
+                        if message != notice:
+                            print(f"[UNO] {message}", flush=True)
+                        notice = message
+                        # Keep the last video frame on screen during brief Wi-Fi
+                        # hiccups; only switch to the black screen if > 6 s old.
+                        if last_image and time.monotonic() - last_image > 6:
+                            last_image = 0
+                    elif kind == "frame" and jpeg:
+                        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                        if image is None:
+                            continue
+                        for x1, y1, x2, y2, confidence in metadata.get("boxes", []):
+                            cv2.rectangle(image, (round(x1), round(y1)), (round(x2), round(y2)), (0, 255, 0), 2)
+                        canvas = cv2.resize(image, (800, round(image.shape[0] * 800 / image.shape[1])))
+                        cap_ms = metadata.get("capture_ms")
+                        timing = (f"AI: {metadata.get('processing_ms')} ms   Net: {cap_ms} ms"
+                                  if cap_ms is not None else
+                                  f"On-board processing: {metadata.get('processing_ms')} ms")
+                        lines = [metadata.get("status", ""),
+                                 f"Height: {metadata.get('height_cm')} cm   Distance: {metadata.get('distance_m')} m",
+                                 f"Weight: {metadata.get('weight_kg')} kg {'LOCK' if metadata.get('weight_stable') else 'moving'}   BMI: {metadata.get('bmi')}",
+                                 timing]
+                        for i, line in enumerate(lines):
+                            cv2.putText(canvas, line, (10, 25 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
+                        background = canvas
+                        last_image = time.monotonic()
+                if not last_image or time.monotonic() - last_image > 15:
+                    screen = np.zeros((480, 800, 3), np.uint8)
+                    text = notice if not last_image else "No fresh frame from YOLO UNO"
+                    # Wrap long diagnostics (reason | URL | UNO IP) to fit the window.
+                    lines = [part.strip() for part in text.split("|")]
+                    wrapped = []
+                    for line in lines:
+                        while len(line) > 60:
+                            cut = line.rfind(" ", 0, 60)
+                            cut = cut if cut > 0 else 60
+                            wrapped.append(line[:cut])
+                            line = line[cut:].strip()
+                        wrapped.append(line)
+                    for i, line in enumerate(wrapped[:14]):
+                        cv2.putText(screen, line, (12, 50 + 30 * i),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
+                else:
+                    screen = background
+                cv2.imshow(title, screen)
+                key = cv2.waitKey(5) & 0xff
+                if key in (ord('q'), ord('Q'), 27) or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

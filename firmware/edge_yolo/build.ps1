@@ -53,6 +53,49 @@ Write-Host "[SmartScale] Using IDF Tools from: $env:IDF_TOOLS_PATH" -ForegroundC
 . $exportScript
 Push-Location $PSScriptRoot
 try {
+    # Ensure ESP-DL YOLO26 component sources exist (auto-bootstrap on a new PC).
+    $yoloCandidates = @(
+        (Join-Path $PSScriptRoot '../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
+        (Join-Path $PSScriptRoot '../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
+        (Join-Path $PSScriptRoot '../../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt')
+    )
+    $foundYolo = $false
+    foreach ($c in $yoloCandidates) {
+        if (Test-Path -LiteralPath $c) { $foundYolo = $true; break }
+    }
+    if (!$foundYolo) {
+        Write-Host "[SmartScale] Bootstrapping ESP-DL sources for first-time setup..." -ForegroundColor Yellow
+        & (Join-Path $PSScriptRoot 'tools/prepare_sources.ps1')
+    }
+
+    # If dependencies.lock references a local path from another machine, refresh it.
+    $lockFile = Join-Path $PSScriptRoot 'dependencies.lock'
+    if (Test-Path -LiteralPath $lockFile) {
+        $lockText = Get-Content -LiteralPath $lockFile -Raw
+        if ($lockText -match 'path:\s*([^\r\n]+)') {
+            $lockedPath = $Matches[1].Trim()
+            if (!(Test-Path -LiteralPath $lockedPath)) {
+                Write-Host "[SmartScale] Refreshing dependencies.lock for this PC..." -ForegroundColor Yellow
+                Remove-Item -LiteralPath $lockFile -Force
+                $managedDir = Join-Path $PSScriptRoot 'managed_components'
+                if (Test-Path -LiteralPath $managedDir) {
+                    Remove-Item -LiteralPath $managedDir -Recurse -Force
+                }
+            }
+        }
+    }
+
+    # Ensure sdkconfig includes the 240 MHz CPU and 32 KB lwIP TCP window defaults.
+    $sdkconfigFile = Join-Path $PSScriptRoot 'sdkconfig'
+    if (Test-Path -LiteralPath $sdkconfigFile) {
+        $sdkText = Get-Content -LiteralPath $sdkconfigFile -Raw
+        if ($sdkText -notmatch 'CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y' -or
+            $sdkText -notmatch 'CONFIG_LWIP_TCP_WND_DEFAULT=32768') {
+            Write-Host "[SmartScale] Updating sdkconfig from sdkconfig.defaults..." -ForegroundColor Yellow
+            Remove-Item -LiteralPath $sdkconfigFile -Force
+        }
+    }
+
     idf.py -D IDF_TARGET=esp32s3 build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if ($Flash) {

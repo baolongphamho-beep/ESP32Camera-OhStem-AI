@@ -14,12 +14,21 @@ Mi Scale 2 -------- BLE ------->     |
 
 Không chạy `camera/smartscale_camera.py` hoặc launcher cũ trong chế độ này. Không cần UART kết quả phân loại Face/No Face. Hai bo vẫn cần đường truyền ảnh Wi-Fi và nguồn điện riêng/phù hợp.
 
-## Phần cứng
+## Quy trình Setup chuẩn từ đầu (Đấu nối, Camera, Nạp Firmware & Chạy)
 
-- LCD: cổng I2C đỏ trên YOLO UNO, **SDA=GPIO11, SCL=GPIO12**. Firmware dò PCF8574 tại 0x20..0x27 và 0x38..0x3f, thử thêm GPIO6/7; không dò GPIO8/9. Dò lại sau 5 giây nếu LCD chưa sẵn sàng.
-- Cân: MAC `70:87:9e:ea:3a:e0`. Firmware mới đọc bản tin quảng bá BLE service 0x181D; không kết nối GATT như firmware Arduino cũ. Cần đánh thức cân và kiểm tra cân có phát bản tin cân nặng khi đứng lên. Nếu cân không phát quảng bá, cần bổ sung đường nhận GATT trước khi dùng thực tế.
-- Camera: bật chế độ lấy ảnh `/capture`, ưu tiên **QVGA 320x240**, camera và UNO cùng Wi-Fi 2.4 GHz có thể truy cập nhau. Tắt xử lý Face/No Face trên giao diện camera để giảm tải nếu có thể. Không cần mở stream trên trình duyệt khi đo.
-- Type-C dùng truyền dữ liệu. Đóng Serial Monitor trước khi nạp hoặc mở USB viewer.
+1. **Đấu nối mạch theo Netlist:**
+   - **LCD 16×2 I2C** cắm vào cổng I2C đỏ trên YOLO UNO: **`SDA = GPIO 11`**, **`SCL = GPIO 12`**, `VCC = 5V`, `GND = GND` (Firmware tự dò địa chỉ PCF8574 tại `0x20..0x27` và `0x38..0x3F`).
+   - **Camera AI OhStem**: cấp nguồn 5V qua cổng Type-C.
+   - **Cân Mi Scale 2**: lắp pin, phát quảng bá BLE service `0x181D` (MAC `70:87:9e:ea:3a:e0`).
+   - **YOLO UNO**: cắm cáp USB Type-C (có truyền dữ liệu) vào máy tính.
+2. **Vào chế độ `Stream video` trên Camera AI & Setup lại Wi-Fi cho Camera:**
+   - Bấm nút trên Camera AI mở menu màn hình OLED sau lưng camera, chọn mục **`6. Stream video`** (bắt buộc để mở endpoint `/capture`).
+   - Nếu camera chưa nối Wi-Fi (hoặc đổi Wi-Fi mới): kết nối điện thoại/laptop vào Wi-Fi do camera phát ra (`ohstemcam_...`), mở trình duyệt vào **`http://192.168.4.1`**, chọn mạng Wi-Fi 2.4 GHz và nhập mật khẩu.
+   - Khi kết nối thành công, màn hình OLED của camera sẽ hiện **địa chỉ IP** (ví dụ `10.127.7.68`). Đóng mọi tab trình duyệt đang mở trang camera để tránh lỗi `{"busy":1}`.
+3. **(Song song) Biên dịch và nạp Firmware xuống YOLO UNO:**
+   - Xem cổng COM của YOLO UNO trong Device Manager (ví dụ `COM13` hoặc `COM9`), sau đó chạy lệnh bên dưới.
+4. **Chạy chương trình kèm `--configure` rồi vận hành:**
+   - Chạy `python camera/usb_viewer.py --port COM13 --configure`, nhập SSID/Password Wi-Fi và IP camera rồi bắt đầu đo. Lần sau chỉ cần chạy `python camera/usb_viewer.py --port COM13`.
 
 ## Biên dịch và nạp
 
@@ -46,7 +55,7 @@ Các file sau biên dịch ở `build/`: `smartscale_edge_yolo.bin`, `bootloader
 .\.venv-camera\Scripts\python.exe camera/usb_viewer.py --port COM9 --configure
 ```
 
-Nhập SSID, mật khẩu Wi-Fi (ẩn trên màn hình), URL ảnh thật của camera như `http://10.127.7.68/capture`, và thông số lắp đặt. Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP.
+Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập), URL ảnh thật của camera như `http://10.127.7.68/capture`, và thông số lắp đặt. Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP.
 
 - **fixed**: camera đặt ngang, biết khoảng cách tới vị trí đứng. Nhập khoảng cách (m), chiều cao thật người chuẩn (cm). Nhập `fy/H = 0` để hiệu chuẩn tự động ngay box toàn thân đầu tiên. Người đầu tiên trong khung phải chính là người chuẩn, đứng thẳng và thấy cả đỉnh đầu lẫn bàn chân. Sau đó UNO lưu tiêu cự để đo người tiếp theo ở cùng vị trí.
 - **ground**: nhập độ cao tâm camera tính từ **mặt trên bàn cân**, góc nghiêng xuống (độ) và `fy/H` đã hiệu chuẩn. Khoảng cách được tính từ tia chiếu chân cắt mặt phẳng bàn cân. `fy/H` bắt buộc khác 0.

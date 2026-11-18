@@ -64,8 +64,28 @@ MeasurementView stateSnapshot() {
 // =========================================================================
 static EdgeConfig s_config;
 static SemaphoreHandle_t s_config_mutex = nullptr;
+static SemaphoreHandle_t s_usb_tx_mutex = nullptr;
 static bool s_in_config_session = false;
 static EdgeConfig s_staging_config;
+
+static void normalizeCameraUrl(char* url, size_t cap) {
+    if (!url || !url[0]) return;
+    size_t len = strlen(url);
+    while (len > 0 && url[len - 1] == '/') {
+        url[--len] = '\0';
+    }
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "http://%s", url);
+        strncpy(url, tmp, cap - 1);
+        url[cap - 1] = '\0';
+        len = strlen(url);
+    }
+    const char* host = (strncmp(url, "https://", 8) == 0) ? (url + 8) : (url + 7);
+    if (strchr(host, '/') == nullptr && len + 8 < cap) {
+        strcat(url, "/capture");
+    }
+}
 
 static void loadConfigFromNvs(EdgeConfig& cfg) {
     nvs_handle_t h;
@@ -77,6 +97,7 @@ static void loadConfigFromNvs(EdgeConfig& cfg) {
     nvs_get_str(h, "pass", cfg.password, &sz);
     sz = sizeof(cfg.cameraUrl);
     nvs_get_str(h, "camera", cfg.cameraUrl, &sz);
+    normalizeCameraUrl(cfg.cameraUrl, sizeof(cfg.cameraUrl));
     sz = sizeof(cfg.scaleMac);
     nvs_get_str(h, "mac", cfg.scaleMac, &sz);
 
@@ -147,6 +168,8 @@ void saveFocalIfUnchanged(const EdgeConfig& original, float focal) {
 // =========================================================================
 static bool s_wifi_ready = false;
 static bool s_wifi_started = false;
+static char s_wifi_ip[16] = "no IP";
+static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void wifiEventHandler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data) {
@@ -154,14 +177,29 @@ static void wifiEventHandler(void* arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_ready = false;
+        portENTER_CRITICAL(&s_ip_mux);
+        strcpy(s_wifi_ip, "no IP");
+        portEXIT_CRITICAL(&s_ip_mux);
         ESP_LOGW(TAG, "Wi-Fi disconnected; retrying in 2 seconds...");
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         auto* event = reinterpret_cast<ip_event_got_ip_t*>(event_data);
         ESP_LOGI(TAG, "Wi-Fi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        char ip[16];
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+        portENTER_CRITICAL(&s_ip_mux);
+        strcpy(s_wifi_ip, ip);
+        portEXIT_CRITICAL(&s_ip_mux);
         s_wifi_ready = true;
     }
+}
+
+void wifiIp(char* out, size_t size) {
+    if (!out || !size) return;
+    portENTER_CRITICAL(&s_ip_mux);
+    snprintf(out, size, "%s", s_wifi_ip);
+    portEXIT_CRITICAL(&s_ip_mux);
 }
 
 static void applyWifiConfig(const EdgeConfig& cfg) {
@@ -181,7 +219,9 @@ static void applyWifiConfig(const EdgeConfig& cfg) {
     if (!s_wifi_started) {
         s_wifi_started = true;
         esp_wifi_start();
+        esp_wifi_set_ps(WIFI_PS_NONE);
     } else {
+        esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_connect();
     }
 }
@@ -213,6 +253,30 @@ static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev
     return ~crc;
 }
 
+static bool usbWriteAll(const void* data, size_t length, uint32_t timeout_ms) {
+    const auto* ptr = static_cast<const uint8_t*>(data);
+    const uint32_t deadline = clockMs() + timeout_ms;
+    size_t sent = 0;
+    while (sent < length) {
+        // Chunk size must be <= usb_cfg.tx_buffer_size because ESP-IDF's
+        // xRingbufferSend immediately rejects any write larger than the ringbuffer.
+        const size_t chunk = std::min<size_t>(length - sent, 512);
+        const int32_t remain = static_cast<int32_t>(deadline - clockMs());
+        if (remain <= 0) return false;
+        // When a PC USB viewer is open, Windows drains 512 B in < 2 ms.
+        // If the ringbuffer stays full for 25 ms, no viewer is reading: abort immediately
+        // so the main loop never stalls when the USB viewer is closed.
+        const int n = usb_serial_jtag_write_bytes(
+            ptr + sent, chunk, pdMS_TO_TICKS(std::min<int32_t>(remain, 25)));
+        if (n > 0) {
+            sent += static_cast<size_t>(n);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     if (!metadata) return;
     const uint32_t json_len = static_cast<uint32_t>(strlen(metadata));
@@ -229,11 +293,11 @@ void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     hdr.jpeg_len = jpeg_len;
     hdr.crc = crc;
 
-    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
-    usb_serial_jtag_write_bytes(metadata, json_len, pdMS_TO_TICKS(100));
-    if (jpeg_len > 0) {
-        usb_serial_jtag_write_bytes(jpeg, jpeg_len, pdMS_TO_TICKS(500));
+    if (s_usb_tx_mutex) xSemaphoreTake(s_usb_tx_mutex, portMAX_DELAY);
+    if (usbWriteAll(&hdr, sizeof(hdr), 100) && usbWriteAll(metadata, json_len, 200) && jpeg_len > 0) {
+        usbWriteAll(jpeg, jpeg_len, 1500);
     }
+    if (s_usb_tx_mutex) xSemaphoreGive(s_usb_tx_mutex);
 }
 
 static void processConfigLine(const std::string& line) {
@@ -245,10 +309,20 @@ static void processConfigLine(const std::string& line) {
         if (eq != std::string::npos) {
             const std::string key = line.substr(4, eq - 4);
             const std::string val = line.substr(eq + 1);
-            if (key == "ssid") strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
-            else if (key == "password") strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
-            else if (key == "camera") strncpy(s_staging_config.cameraUrl, val.c_str(), sizeof(s_staging_config.cameraUrl) - 1);
-            else if (key == "mac") strncpy(s_staging_config.scaleMac, val.c_str(), sizeof(s_staging_config.scaleMac) - 1);
+            if (key == "ssid") {
+                strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
+                s_staging_config.ssid[sizeof(s_staging_config.ssid) - 1] = '\0';
+            } else if (key == "password") {
+                strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
+                s_staging_config.password[sizeof(s_staging_config.password) - 1] = '\0';
+            } else if (key == "camera") {
+                strncpy(s_staging_config.cameraUrl, val.c_str(), sizeof(s_staging_config.cameraUrl) - 1);
+                s_staging_config.cameraUrl[sizeof(s_staging_config.cameraUrl) - 1] = '\0';
+                normalizeCameraUrl(s_staging_config.cameraUrl, sizeof(s_staging_config.cameraUrl));
+            } else if (key == "mac") {
+                strncpy(s_staging_config.scaleMac, val.c_str(), sizeof(s_staging_config.scaleMac) - 1);
+                s_staging_config.scaleMac[sizeof(s_staging_config.scaleMac) - 1] = '\0';
+            }
             else if (key == "mode") s_staging_config.groundMode = (val == "ground");
             else if (key == "distance") s_staging_config.distanceM = strtof(val.c_str(), nullptr);
             else if (key == "reference") s_staging_config.referenceCm = strtof(val.c_str(), nullptr);
@@ -518,17 +592,36 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
     return 0;
 }
 
+static bool s_ble_synced = false;
+static bool s_ble_paused = false;
+
 static void bleStartScan() {
+    if (!s_ble_synced || s_ble_paused || ble_gap_disc_active()) return;
     struct ble_gap_disc_params disc_params = {};
     disc_params.filter_duplicates = 0;
     disc_params.passive = 1;
-    disc_params.itvl = 1600; // 1000ms
-    disc_params.window = 1600;
+    // 25 ms window every 200 ms (12.5% duty cycle) instead of 100% so BLE
+    // does not starve Wi-Fi TCP packets on the shared 2.4 GHz antenna.
+    disc_params.itvl = 320;
+    disc_params.window = 40;
     ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, bleGapEventHandler, nullptr);
+}
+
+void bleSetCapturePriority(bool capturing) {
+    s_ble_paused = capturing;
+    if (!s_ble_synced) return;
+    if (capturing) {
+        if (ble_gap_disc_active()) {
+            ble_gap_disc_cancel();
+        }
+    } else {
+        bleStartScan();
+    }
 }
 
 static void bleSyncCallback() {
     ESP_LOGI(TAG, "NimBLE host synced; starting passive scale scanner...");
+    s_ble_synced = true;
     bleStartScan();
 }
 
@@ -542,6 +635,7 @@ static void bleHostTask(void* param) {
 // =========================================================================
 void edgeIoInit() {
     s_config_mutex = xSemaphoreCreateMutex();
+    s_usb_tx_mutex = xSemaphoreCreateMutex();
     s_lcd_mutex = xSemaphoreCreateMutex();
 
     // 1. NVS
@@ -553,7 +647,10 @@ void edgeIoInit() {
     loadConfigFromNvs(s_config);
 
     // 2. USB Serial / JTAG
+    // Default tx_buffer_size is only 256 B, which silently drops any write > 256 B.
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_cfg.tx_buffer_size = 4096;
+    usb_cfg.rx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&usb_cfg);
     xTaskCreate(usbReceiverTask, "usb_rx", 4096, nullptr, 4, nullptr);
 
