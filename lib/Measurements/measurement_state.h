@@ -52,6 +52,15 @@ public:
 
     void clearWeight() { weightValid_ = false; weightStable_ = false; }
 
+    // BLE diagnostics without a camera session; never provides height or BMI.
+    MeasurementView weightView(uint32_t now) const {
+        MeasurementView out;
+        out.hasWeight = weightValid_ && now - weightAt_ <= WEIGHT_TTL_MS;
+        out.weightStable = out.hasWeight && weightStable_;
+        if (out.hasWeight) out.weightKg = weight_;
+        return out;
+    }
+
     MeasurementView view(uint32_t now) const {
         MeasurementView out;
         if (now - cameraAt_ > CAMERA_TTL_MS) return out;

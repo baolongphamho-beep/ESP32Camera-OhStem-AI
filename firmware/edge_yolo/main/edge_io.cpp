@@ -4,13 +4,17 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
-
+#include <atomic>
+#include <stdio.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
+#include "esp_private/esp_clk.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_wifi.h"
@@ -45,6 +49,20 @@ uint32_t clockMs() {
 // =========================================================================
 static MeasurementState s_measurements;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static std::atomic<bool> s_power_active{true};
+static esp_pm_lock_handle_t s_active_cpu_lock = nullptr;
+static esp_pm_lock_handle_t s_active_sleep_lock = nullptr;
+static esp_pm_lock_handle_t s_usb_sleep_lock = nullptr;
+static std::atomic<bool> s_usb_sleep_blocked{true};
+static void initPowerManagement();
+static void powerMonitorTask(void* arg);
+
+MeasurementView scaleSnapshot() {
+    portENTER_CRITICAL(&s_state_mux);
+    const auto view = s_measurements.weightView(clockMs());
+    portEXIT_CRITICAL(&s_state_mux);
+    return view;
+}
 
 void cameraState(PersonStatus status, float height, float distance) {
     portENTER_CRITICAL(&s_state_mux);
@@ -145,8 +163,13 @@ void saveFocalIfUnchanged(const EdgeConfig& original, float focal) {
 // =========================================================================
 // 4. Wi-Fi Station
 // =========================================================================
-static bool s_wifi_ready = false;
-static bool s_wifi_started = false;
+static std::atomic<bool> s_wifi_ready{false};
+static std::atomic<bool> s_wifi_started{false};
+
+static void applyWifiPowerSave(bool active) {
+    // Keep the station associated; MAX_MODEM uses the configured listen interval.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(active ? WIFI_PS_NONE : WIFI_PS_MAX_MODEM));
+}
 
 static void wifiEventHandler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data) {
@@ -175,9 +198,11 @@ static void applyWifiConfig(const EdgeConfig& cfg) {
     memcpy(wifi_cfg.sta.ssid, cfg.ssid, (sizeof(wifi_cfg.sta.ssid) - 1 < sizeof(cfg.ssid)) ? sizeof(wifi_cfg.sta.ssid) - 1 : sizeof(cfg.ssid));
     memcpy(wifi_cfg.sta.password, cfg.password, (sizeof(wifi_cfg.sta.password) - 1 < sizeof(cfg.password)) ? sizeof(wifi_cfg.sta.password) - 1 : sizeof(cfg.password));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_cfg.sta.listen_interval = 3;
 
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    applyWifiPowerSave(s_power_active.load());
     if (!s_wifi_started) {
         s_wifi_started = true;
         esp_wifi_start();
@@ -201,6 +226,25 @@ struct UsbPacketHeader {
     uint32_t crc;
 };
 #pragma pack(pop)
+static SemaphoreHandle_t s_usb_tx_mutex = nullptr;
+
+static bool usbWriteAll(const void* buffer, size_t length, uint32_t timeoutMs) {
+    const auto* data = static_cast<const uint8_t*>(buffer);
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(timeoutMs);
+    size_t offset = 0;
+    while (offset < length) {
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= timeout) return false;
+        // The default TX ring buffer is only 256 bytes. Larger writes fail
+        // atomically; bound every item and let the driver drain between items.
+        const size_t chunk = std::min(size_t(128), length - offset);
+        const int written = usb_serial_jtag_write_bytes(data + offset, chunk, timeout - elapsed);
+        if (written <= 0) return false;
+        offset += static_cast<size_t>(written);
+    }
+    return true;
+}
 
 static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev_crc = 0) {
     uint32_t crc = ~prev_crc;
@@ -215,6 +259,8 @@ static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev
 
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     if (!metadata) return;
+    // Do not wake repeatedly on USB write timeouts with a power-only supply.
+    if (!usb_serial_jtag_is_connected()) return;
     const uint32_t json_len = static_cast<uint32_t>(strlen(metadata));
     const uint32_t jpeg_len = (jpeg && length > 0) ? static_cast<uint32_t>(length) : 0;
 
@@ -229,11 +275,12 @@ void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     hdr.jpeg_len = jpeg_len;
     hdr.crc = crc;
 
-    usb_serial_jtag_write_bytes(&hdr, sizeof(hdr), pdMS_TO_TICKS(50));
-    usb_serial_jtag_write_bytes(metadata, json_len, pdMS_TO_TICKS(100));
-    if (jpeg_len > 0) {
-        usb_serial_jtag_write_bytes(jpeg, jpeg_len, pdMS_TO_TICKS(500));
-    }
+    // Keep config replies and image/telemetry packets from interleaving.
+    if (xSemaphoreTake(s_usb_tx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    const bool headerSent = usbWriteAll(&hdr, sizeof(hdr), 50);
+    const bool jsonSent = headerSent && usbWriteAll(metadata, json_len, 100);
+    if (jsonSent && jpeg_len > 0) usbWriteAll(jpeg, jpeg_len, 1500);
+    xSemaphoreGive(s_usb_tx_mutex);
 }
 
 static void processConfigLine(const std::string& line) {
@@ -296,6 +343,7 @@ static void usbReceiverTask(void* pvParameters) {
 // =========================================================================
 static uint8_t s_lcd_addr = 0x21; // Default lab address
 static bool s_lcd_ready = false;
+static bool s_lcd_backlight = true; // Protected by s_lcd_mutex after init.
 static char s_lcd_msg_first[17] = {};
 static char s_lcd_msg_second[17] = {};
 static uint32_t s_lcd_override_until = 0;
@@ -325,7 +373,8 @@ static bool i2cTransmit(const uint8_t* data, size_t len) { return false; }
 #endif
 
 static void pcfWriteNibble(uint8_t nibble, bool is_data) {
-    const uint8_t b = (nibble & 0xF0) | (is_data ? 0x01 : 0x00) | 0x08; // 0x08 = Backlight
+    const uint8_t b = (nibble & 0xF0) | (is_data ? 0x01 : 0x00) |
+                      (s_lcd_backlight ? 0x08 : 0x00);
     uint8_t seq[2] = {
         static_cast<uint8_t>(b | 0x04),  // Enable HIGH
         static_cast<uint8_t>(b & ~0x04)  // Enable LOW
@@ -421,12 +470,41 @@ void lcdMessage(const char* first, const char* second) {
     xSemaphoreGive(s_lcd_mutex);
 }
 
+void lcdSetBacklight(bool on) {
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    s_lcd_backlight = on;
+    if (s_lcd_ready) {
+        // E=0: changing only the backlight does not latch an LCD command.
+        const uint8_t value = on ? 0x08 : 0x00;
+        i2cTransmit(&value, 1);
+    }
+    xSemaphoreGive(s_lcd_mutex);
+}
+
 static void lcdTask(void* pvParameters) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(250));
         if (!s_lcd_ready) continue;
 
         xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+        if (!s_lcd_backlight) {
+            xSemaphoreGive(s_lcd_mutex);
+            continue; // Avoid continuous I2C writes while asleep.
+        }
+#ifdef EDGE_SCALE_ONLY
+        const auto weight = scaleSnapshot();
+        if (weight.hasWeight) {
+            char line[20];
+            snprintf(line, sizeof(line), "W:%.2f kg", weight.weightKg);
+            lcdSetLine(0, line);
+            lcdSetLine(1, weight.weightStable ? "Stable: LOCK" : "Measuring...");
+        } else {
+            lcdSetLine(0, "Mi Scale 2 ready");
+            lcdSetLine(1, "Step on scale");
+        }
+        xSemaphoreGive(s_lcd_mutex);
+        continue;
+#endif
         if (clockMs() < s_lcd_override_until) {
             xSemaphoreGive(s_lcd_mutex);
             continue;
@@ -478,9 +556,119 @@ static void lcdTask(void* pvParameters) {
 // 7. Bluetooth LE (Mi Scale 2 Advertisement Observer)
 // =========================================================================
 static void bleStartScan();
+static std::atomic<bool> s_ble_standby{false};
+static std::atomic<bool> s_ble_synced{false};
+static std::atomic<unsigned> s_ble_scan_duty{0};
+
+unsigned bleScanDutyPercent() { return s_ble_scan_duty.load(); }
+bool powerModeActive() { return s_power_active.load(); }
+
+static void configureCpuPower(bool active) {
+    esp_pm_config_t cfg = {};
+    // RTOS runnable-task locks request CPU_MAX too. Cap that maximum at 80
+    // in standby, so telemetry/task wakeups do not raise it back to 240 MHz.
+    cfg.max_freq_mhz = active ? 240 : 80;
+    cfg.min_freq_mhz = 80;
+    cfg.light_sleep_enable = true;
+    ESP_ERROR_CHECK(esp_pm_configure(&cfg));
+}
+
+static void initPowerManagement() {
+    // ACTIVE starts with both locks held. STANDBY releases only our own locks;
+    // BLE, Wi-Fi, I2C and USB remain responsible for their driver constraints.
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "edge_active_cpu", &s_active_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_active", &s_active_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_usb", &s_usb_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_sleep_lock));
+    configureCpuPower(true);
+}
+
+static void powerMonitorTask(void* arg) {
+    while (true) {
+        const bool connected = usb_serial_jtag_is_connected();
+        if (connected != s_usb_sleep_blocked.load()) {
+            if (connected) ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_sleep_lock));
+            else ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_sleep_lock));
+            s_usb_sleep_blocked.store(connected);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+EdgePowerView powerSnapshot() {
+    EdgePowerView out;
+    esp_pm_config_t cfg = {};
+    if (esp_pm_get_configuration(&cfg) == ESP_OK) {
+        out.pmEnabled = true;
+        out.lightSleepConfigured = cfg.light_sleep_enable;
+        out.minCpuMhz = cfg.min_freq_mhz;
+        out.maxCpuMhz = cfg.max_freq_mhz;
+    }
+    out.cpuMhz = esp_clk_cpu_freq() / 1000000;
+    out.usbSleepBlocked = s_usb_sleep_blocked.load();
+    out.wifiStarted = s_wifi_started.load();
+    esp_pm_lock_stats_t stats[ESP_PM_LOCK_MAX] = {};
+    if (esp_pm_get_lock_stats_all(stats) == ESP_OK) {
+        out.noLightSleepLocks = static_cast<int>(stats[ESP_PM_NO_LIGHT_SLEEP].acquired);
+    }
+    wifi_ps_type_t ps;
+    if (esp_wifi_get_ps(&ps) == ESP_OK) {
+        out.wifiPowerSave = ps == WIFI_PS_NONE ? "NONE" :
+                           ps == WIFI_PS_MAX_MODEM ? "MAX_MODEM" : "MIN_MODEM";
+    }
+    return out;
+}
+void bleSetLowPowerScan(bool standby) {
+    if (s_ble_standby.exchange(standby) == standby) return;
+    if (!s_ble_synced.load()) return; // Sync callback starts the selected mode.
+    const int rc = ble_gap_disc_cancel();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "BLE scan cancel failed: %d", rc);
+        return;
+    }
+    s_ble_scan_duty.store(0);
+    bleStartScan();
+}
+
+void setPowerMode(bool active) {
+    if (s_power_active.load() == active) return;
+    if (active) {
+        configureCpuPower(true);
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
+    }
+    applyWifiPowerSave(active);
+    if (!active) lcdMessage("Standby", "Step on the scale fatass");
+    lcdSetBacklight(active);
+    bleSetLowPowerScan(!active);
+    s_power_active.store(active);
+    if (!active) {
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_active_sleep_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_active_cpu_lock));
+        configureCpuPower(false);
+    }
+    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%u%%", active ? "ACTIVE" : "STANDBY",
+             bleScanDutyPercent());
+}
 
 static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
+      const uint8_t* addr = event->disc.addr.val;
+char receivedMac[18];
+
+snprintf(receivedMac, sizeof(receivedMac),
+         "%02x:%02x:%02x:%02x:%02x:%02x",
+         addr[5], addr[4], addr[3],
+         addr[2], addr[1], addr[0]);
+
+const EdgeConfig cfg = configSnapshot();
+
+// Khác MAC cân đã cấu hình thì bỏ qua gói.
+if (strcasecmp(receivedMac, cfg.scaleMac) != 0) {
+    return 0;
+}
         const uint8_t* data = event->disc.data;
         const int len = event->disc.length_data;
         int idx = 0;
@@ -519,15 +707,23 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
 }
 
 static void bleStartScan() {
+    if (ble_gap_disc_active()) return;
+    const bool standby = s_ble_standby.load();
     struct ble_gap_disc_params disc_params = {};
     disc_params.filter_duplicates = 0;
     disc_params.passive = 1;
-    disc_params.itvl = 1600; // 1000ms
-    disc_params.window = 1600;
-    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, bleGapEventHandler, nullptr);
+    // Keep the standby interval fixed for A/B tests; only vary its scan window.
+    // NimBLE units are 0.625 ms: 960 = 600 ms; active=100/100 ms.
+    disc_params.itvl = standby ? 960 : 160;
+    disc_params.window = standby ? (960 * EDGE_STANDBY_SCAN_PERCENT / 100) : 160;
+    const int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params,
+                               bleGapEventHandler, nullptr);
+    if (rc == 0) s_ble_scan_duty.store(standby ? EDGE_STANDBY_SCAN_PERCENT : 100);
+    else ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
 }
 
 static void bleSyncCallback() {
+    s_ble_synced.store(true);
     ESP_LOGI(TAG, "NimBLE host synced; starting passive scale scanner...");
     bleStartScan();
 }
@@ -543,6 +739,7 @@ static void bleHostTask(void* param) {
 void edgeIoInit() {
     s_config_mutex = xSemaphoreCreateMutex();
     s_lcd_mutex = xSemaphoreCreateMutex();
+    initPowerManagement();
 
     // 1. NVS
     esp_err_t err = nvs_flash_init();
@@ -553,8 +750,12 @@ void edgeIoInit() {
     loadConfigFromNvs(s_config);
 
     // 2. USB Serial / JTAG
+    s_usb_tx_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_usb_tx_mutex ? ESP_OK : ESP_ERR_NO_MEM);
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_serial_jtag_driver_install(&usb_cfg);
+    ESP_ERROR_CHECK(xTaskCreate(powerMonitorTask, "power_monitor", 2048, nullptr, 3, nullptr) == pdPASS
+                    ? ESP_OK : ESP_ERR_NO_MEM);
     xTaskCreate(usbReceiverTask, "usb_rx", 4096, nullptr, 4, nullptr);
 
     // 3. LCD & Display Task
@@ -570,6 +771,7 @@ void edgeIoInit() {
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEventHandler, nullptr, nullptr);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifiEventHandler, nullptr, nullptr);
     esp_wifi_set_mode(WIFI_MODE_STA);
+    applyWifiPowerSave(true);
     applyWifiConfig(s_config);
 
     // 5. Bluetooth LE (NimBLE)

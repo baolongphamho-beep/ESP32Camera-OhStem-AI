@@ -24,7 +24,7 @@ dependencies:
     - name: espressif/dl_fft
       version: '>=0.8.0'
     source:
-      path: D:\PROJECT\.edge-deps\esp-dl\esp-dl
+      path: ../../.edge-deps/esp-dl/esp-dl
       type: local
     targets:
     - esp32
@@ -59,9 +59,9 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.6
+    version: 6.1.0
 direct_dependencies:
 - espressif/esp-dl
 manifest_hash: 441e22c6e801bc987b2a83d17ad5fbec4ab3c536b76f4c210de456249b001081
 target: esp32s3
-version: 2.0.0
+version: 3.0.0

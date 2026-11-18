@@ -4,6 +4,24 @@
 #include "camera_packet.h"
 
 int main() {
+    // Scale-only diagnostics must work before any camera packet arrives.
+    MeasurementState scaleOnly;
+    assert(!scaleOnly.weightView(0).hasWeight);
+    scaleOnly.weight(100, 13.25f, false);
+    assert(scaleOnly.weightView(100).hasWeight);
+    assert(!scaleOnly.weightView(100).weightStable);
+    assert(!scaleOnly.view(100).hasWeight); // Existing camera gating stays intact.
+    scaleOnly.weight(200, 13.25f, true);
+    assert(scaleOnly.weightView(200).weightStable);
+    assert(std::fabs(scaleOnly.weightView(200).weightKg - 13.25f) < 0.001f);
+    assert(!scaleOnly.weightView(200).hasBMI);
+    assert(scaleOnly.weightView(30200).hasWeight);
+    assert(!scaleOnly.weightView(30201).hasWeight);
+    scaleOnly.clearWeight();
+    assert(!scaleOnly.weightView(201).hasWeight);
+    scaleOnly.weight(0xfffffff5U, 13.25f, true);
+    assert(scaleOnly.weightView(20).weightStable);
+
     MeasurementState state;
     assert(state.view(0).status == PersonStatus::None);
     state.camera(1000, PersonStatus::Measured, 180, 3);

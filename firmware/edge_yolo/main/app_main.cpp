@@ -46,6 +46,43 @@ static size_t capture(const char* url, uint8_t* buffer) {
 
 extern "C" void app_main() {
     edgeIoInit();
+#ifdef EDGE_SCALE_ONLY
+    // Standalone BLE/LCD check: no model loading, capture, or camera state resets.
+    setPowerMode(false);
+    uint32_t lastReportAt = 0;
+    bool firstReport = true;
+    while (true) {
+        const auto scale = scaleSnapshot();
+        // Wake without waiting for LOCK. Removed/zero/expired packets clear hasWeight.
+        const bool active = scale.hasWeight && scale.weightKg > 5.0f;
+        const bool changed = active != powerModeActive();
+        if (changed) setPowerMode(active);
+        const uint32_t now = clockMs();
+        if (firstReport || changed || now - lastReportAt >= 1000) {
+            const auto power = powerSnapshot();
+            char json[512];
+            char weight[24] = "null";
+            if (scale.hasWeight) snprintf(weight, sizeof(weight), "%.2f", scale.weightKg);
+            snprintf(json, sizeof(json),
+                     "{\"kind\":\"scale\",\"phase\":\"%s\",\"ble_duty_percent\":%u,"
+                     "\"weight_kg\":%s,\"weight_stable\":%s,"
+                     "\"pm_enabled\":%s,\"cpu_mhz\":%d,\"cpu_min_mhz\":%d,\"cpu_max_mhz\":%d,"
+                     "\"light_sleep_enabled\":%s,\"usb_sleep_blocked\":%s,\"no_ls_locks\":%d,"
+                     "\"wifi_ps\":\"%s\",\"wifi_started\":%s}",
+                     active ? "ACTIVE" : "STANDBY", bleScanDutyPercent(),
+                     weight, scale.weightStable ? "true" : "false",
+                     power.pmEnabled ? "true" : "false", power.cpuMhz,
+                     power.minCpuMhz, power.maxCpuMhz,
+                     power.lightSleepConfigured ? "true" : "false",
+                     power.usbSleepBlocked ? "true" : "false", power.noLightSleepLocks,
+                     power.wifiPowerSave, power.wifiStarted ? "true" : "false");
+            usbFrame(nullptr, 0, json);
+            firstReport = false;
+            lastReportAt = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#endif
     lcdMessage("Loading YOLO26n", "Please wait");
     // Keep parameters in flash: copying 3 MB into PSRAM would waste scarce RAM.
     auto* model = new dl::Model(reinterpret_cast<const char*>(modelStart),

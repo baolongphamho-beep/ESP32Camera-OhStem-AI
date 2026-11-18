@@ -40,6 +40,53 @@ Các file sau biên dịch ở `build/`: `smartscale_edge_yolo.bin`, `bootloader
 
 ## Nhập cấu hình và xem ảnh
 
+### Kiểm tra riêng cân BLE và LCD (không cần camera)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -Flash -Port COM11
+```
+
+Thay COM11 bằng cổng thực tế. Bản chỉ cân có Smart Standby:
+
+- Lúc khởi động/nghỉ: ghi `Standby / Step on scale`, tắt đèn nền LCD, quét BLE thụ động 60 ms mỗi 600 ms (10%).
+- Gói từ đúng `scaleMac`, cân nặng hợp lệ **trên 5 kg**: chuyển `ACTIVE`, quét 100 ms mỗi 100 ms (100%), bật đèn nền. Không cần chờ cờ ổn định. LCD hiện `W:xx.xx kg / Measuring...` hoặc `Stable: LOCK`.
+- Bước xuống/gói về 0, trọng lượng còn không quá 5 kg, hoặc dữ liệu hết hạn 30 giây: trở về `STANDBY`. Bản thử này chưa giữ kết quả sau khi bước xuống.
+- USB gửi gói SSV1 `kind=scale` kèm `phase`, `ble_duty_percent` (0 nếu chưa bắt đầu quét thành công), `weight_kg`, `weight_stable` mỗi giây và khi đổi trạng thái.
+
+Quản lý nguồn đã bật DFS và Automatic Light Sleep (Tickless Idle). `ACTIVE` đặt dải CPU 80–240 MHz, giữ khóa CPU 240 MHz và khóa ngăn ngủ; `STANDBY` nhả hai khóa đó, giới hạn CPU ở 80 MHz và cho phép ngủ khi không còn khóa driver. Giới hạn tần số lúc nghỉ tránh việc các task/telemetry nâng CPU trở lại 240 MHz qua khóa RTOS. BLE dùng Modem Sleep và giữ main XTAL để duy trì lịch quét trong Light Sleep. Không vào Deep Sleep. Chưa có số liệu dòng tiêu thụ; duty BLE không phải mức giảm điện năng toàn bo. Chế độ chỉ cân không tải AI, không lấy ảnh hay tính chiều cao/BMI.
+
+Wi-Fi dùng `WIFI_PS_MAX_MODEM` khi nghỉ và `WIFI_PS_NONE` khi hoạt động; STA listen interval là 3. Nếu chưa cấu hình SSID thì Wi-Fi chưa start: đọc lại được chế độ PS chỉ chứng minh cấu hình, chưa kiểm chứng tiết kiệm điện hoặc tốc độ lấy ảnh qua Wi-Fi thật.
+
+USB máy tính có SOF sẽ giữ khóa `edge_usb` ngăn Light Sleep để bảo toàn cấu hình/viewer. Khóa này tự nhả khi dùng nguồn USB không có host (sạc/pin dự phòng), khi đó các khóa driver khác vẫn có quyền ngăn ngủ. Không bỏ khóa của driver để ép ngủ. Khi chưa có nguồn độc lập, chỉ kiểm chứng DFS/chuyển trạng thái và cấu hình PS; chưa kết luận chip thực sự vào Light Sleep hoặc tiết kiệm bao nhiêu mA.
+
+Gói `kind=scale` có thêm `pm_enabled`, `cpu_mhz` (tần số tại thời điểm lấy mẫu), `cpu_min_mhz`, `cpu_max_mhz`, `light_sleep_enabled` (đã cấu hình), `usb_sleep_blocked`, `no_ls_locks` (tổng số khóa ngăn ngủ đang giữ), `wifi_ps` và `wifi_started`. `light_sleep_enabled=true` không có nghĩa chip đã ngủ. Khi cắm máy tính, dự kiến `usb_sleep_blocked=true` và `no_ls_locks>=1`.
+
+Đóng Monitor/viewer trước khi chạy công cụ chỉ đọc sau (Python cần `pyserial`, không cần OpenCV):
+
+```powershell
+python camera/power_monitor.py --port COM11 --seconds 30
+```
+
+Để trống cân → bước lên → bước xuống; kiểm tra CPU 80 → 240 → 80 MHz và Wi-Fi PS `MAX_MODEM → NONE → MAX_MODEM`. Công cụ chỉ in khi trạng thái nguồn thay đổi; Ctrl+C đóng monitor, không dừng firmware. Muốn kiểm chứng dòng tiêu thụ/Light Sleep độc lập, cần nguồn ngoài USB host và dụng cụ đo; chưa có thì ghi rõ phần này chưa kiểm chứng.
+
+`sdkconfig.defaults` bật PM/Tickless/BLE modem sleep; `build.ps1` cũng chuyển đúng các key PM cần thiết trong `sdkconfig` cũ sang `y` trước khi build, giữ nguyên các cấu hình khác. Có thể phải biên dịch lại toàn bộ ESP-IDF sau thay đổi PM.
+
+Kiểm tra tại chỗ: để trống cân xem đèn nền tắt, bước lên xem LCD sáng và chốt đúng kg, bước xuống xem đèn nền tắt lại; lặp ít nhất 10 lượt. Nếu bỏ lỡ gói bước xuống, chờ tối đa 30 giây cho timeout. Khi nhận `ACTIVE`, số `ble_duty_percent` phải là 100; khi nghỉ là 10. Chưa kết luận đạt mục tiêu thức dậy dưới 1 giây nếu chưa đo.
+
+TV1 có thể gọi `setPowerMode(bool active)` từ một task ứng dụng khi tích hợp FSM. Hàm điều khiển BLE scan, LCD backlight, khóa CPU/ngủ và Wi-Fi PS; gọi lặp lại cùng trạng thái không tăng bộ đếm khóa. `bleSetLowPowerScan(bool standby)` và `lcdSetBacklight(bool on)` cũng dùng riêng được; không gọi từ ISR/callback BLE. Build lại **không có `-ScaleOnly`** để trở về bản tích hợp; bản tích hợp chưa tự chạy FSM Standby và mặc định giữ hiệu năng ACTIVE.
+
+### Thử độ trễ đánh thức
+
+Thử chẩn đoán độ trễ đánh thức: giữ LCD tắt lúc nghỉ nhưng quét BLE liên tục:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -StandbyScanPercent 100 -Flash -Port COM11
+```
+
+`-StandbyScanPercent` nhận 10, 25, 50 hoặc 100; mặc định 10. Chu kỳ Standby vẫn là 600 ms, chỉ thay cửa sổ quét. Gói USB phải báo `phase=STANDBY` và `ble_duty_percent=100` cho phép thử này; đèn nền vẫn tắt. So sánh ít nhất 5 lượt đứng hẳn lên cân (>5 kg), không chờ LOCK mới tính thời gian LCD sáng. Nếu nhanh hơn ở 100%, thử 25/50% để cân bằng; nếu vẫn trễ, kiểm tra thời điểm cân phát gói trọng lượng. 100% chỉ là cấu hình chẩn đoán, chưa phải phương án tiết kiệm điện cuối cùng. Muốn trở lại 10%, build/nạp lại với `-StandbyScanPercent 10`.
+
+### Bản tích hợp camera
+
 Đã cài dependencies USB viewer trong `.venv-camera` trên máy này. Máy mới có thể tạo venv rồi cài `camera/requirements-usb.txt`.
 
 ```powershell
