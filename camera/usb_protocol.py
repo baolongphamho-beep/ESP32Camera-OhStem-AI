@@ -9,6 +9,36 @@ MAX_JSON = 4096
 MAX_JPEG = 256 * 1024
 
 
+class SessionFilter:
+    """Ignore old pipeline frames after a new scale-session/status packet."""
+    def __init__(self):
+        self.session = None
+        self.phase = None
+
+    def accept(self, metadata):
+        if metadata.get("kind") == "boot":
+            self.session = None
+            self.phase = None
+            return True
+        session = metadata.get("session_id")
+        if not isinstance(session, int) or isinstance(session, bool):
+            return True  # Compatible with older firmware.
+        session &= 0xffffffff
+        if self.session is not None:
+            delta = (session - self.session) & 0xffffffff
+            if delta >= 0x80000000:
+                return False
+        if session != self.session:
+            self.session = session
+            self.phase = None
+        if metadata.get("kind") == "scale":
+            self.phase = metadata.get("phase")
+        if metadata.get("kind") == "frame" and self.phase in {
+                "STANDBY", "DRAINING", "RESULT_HOLD"}:
+            return False
+        return True
+
+
 def packet(metadata, jpeg=b""):
     body = json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode()
     return HEADER.pack(MAGIC, len(body), len(jpeg), zlib.crc32(body + jpeg)) + body + jpeg

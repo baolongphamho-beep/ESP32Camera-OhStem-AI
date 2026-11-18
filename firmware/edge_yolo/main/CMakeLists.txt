@@ -16,3 +16,6 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE MEASUREMENT_CAMERA_TTL_MS=10
 if(SMARTSCALE_SCALE_ONLY)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE EDGE_SCALE_ONLY=1)
 endif()
+if(SMARTSCALE_CAMERA_CONTINUOUS)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE EDGE_CAMERA_CONTINUOUS=1)
+endif()

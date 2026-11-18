@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "measurement_state.h"
+#include "scale_presence.h"
 
 struct EdgeConfig {
     char ssid[33] = {};
@@ -22,9 +23,14 @@ void edgeIoInit();
 EdgeConfig configSnapshot();
 void saveFocalIfUnchanged(const EdgeConfig& original, float focal);
 bool wifiReady();
+void wifiIp(char* out, size_t size); // UNO's own IPv4, or "no IP".
 void cameraState(PersonStatus status, float height = 0, float distance = 0);
+bool cameraStateForScaleSession(uint32_t session, PersonStatus status, float height,
+                                float distance, MeasurementView& out);
 MeasurementView stateSnapshot();
 MeasurementView scaleSnapshot();
+ScaleSample scaleSampleSnapshot();
+void lcdHoldResult(const MeasurementView* result);
 // Call from the application task, never from a BLE callback or ISR.
 void setPowerMode(bool active);
 bool powerModeActive();
@@ -41,7 +47,7 @@ struct EdgePowerView {
 };
 EdgePowerView powerSnapshot();
 void bleSetLowPowerScan(bool standby);
-unsigned bleScanDutyPercent();
+float bleScanDutyPercent();
 void lcdSetBacklight(bool on);
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata);
 void lcdMessage(const char* first, const char* second);

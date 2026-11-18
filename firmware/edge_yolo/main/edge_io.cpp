@@ -48,6 +48,7 @@ uint32_t clockMs() {
 // 2. Global State & Measurement Machine
 // =========================================================================
 static MeasurementState s_measurements;
+static ScalePresence s_scale_presence;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static std::atomic<bool> s_power_active{true};
 static esp_pm_lock_handle_t s_active_cpu_lock = nullptr;
@@ -58,16 +59,44 @@ static void initPowerManagement();
 static void powerMonitorTask(void* arg);
 
 MeasurementView scaleSnapshot() {
+    return scaleSampleSnapshot().measurement;
+}
+
+ScaleSample scaleSampleSnapshot() {
     portENTER_CRITICAL(&s_state_mux);
-    const auto view = s_measurements.weightView(clockMs());
+    const auto view = s_scale_presence.snapshot(clockMs());
     portEXIT_CRITICAL(&s_state_mux);
     return view;
 }
 
+static void updateCameraLocked(PersonStatus status, float height, float distance) {
+    const uint32_t now = clockMs();
+    s_measurements.camera(now, status, height, distance);
+    const auto scale = s_scale_presence.snapshot(now);
+    if (status != PersonStatus::None && status != PersonStatus::Multiple && scale.present()) {
+        s_measurements.weight(now, scale.measurement.weightKg, scale.measurement.weightStable);
+    } else {
+        s_measurements.clearWeight();
+    }
+}
+
 void cameraState(PersonStatus status, float height, float distance) {
     portENTER_CRITICAL(&s_state_mux);
-    s_measurements.camera(clockMs(), status, height, distance);
+    updateCameraLocked(status, height, distance);
     portEXIT_CRITICAL(&s_state_mux);
+}
+
+bool cameraStateForScaleSession(uint32_t session, PersonStatus status, float height,
+                                float distance, MeasurementView& out) {
+    portENTER_CRITICAL(&s_state_mux);
+    const auto scale = s_scale_presence.snapshot(clockMs());
+    const bool valid = scale.present() && scale.sessionId == session;
+    if (valid) {
+        updateCameraLocked(status, height, distance);
+        out = s_measurements.view(clockMs());
+    }
+    portEXIT_CRITICAL(&s_state_mux);
+    return valid;
 }
 
 MeasurementView stateSnapshot() {
@@ -85,6 +114,25 @@ static SemaphoreHandle_t s_config_mutex = nullptr;
 static bool s_in_config_session = false;
 static EdgeConfig s_staging_config;
 
+static void normalizeCameraUrl(char* url, size_t cap) {
+    if (!url || !url[0]) return;
+    size_t len = strlen(url);
+    while (len > 0 && url[len - 1] == '/') {
+        url[--len] = '\0';
+    }
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        char tmp[160];
+        snprintf(tmp, sizeof(tmp), "http://%s", url);
+        strncpy(url, tmp, cap - 1);
+        url[cap - 1] = '\0';
+        len = strlen(url);
+    }
+    const char* host = (strncmp(url, "https://", 8) == 0) ? (url + 8) : (url + 7);
+    if (strchr(host, '/') == nullptr && len + 8 < cap) {
+        strcat(url, "/capture");
+    }
+}
+
 static void loadConfigFromNvs(EdgeConfig& cfg) {
     nvs_handle_t h;
     if (nvs_open("edge_cfg", NVS_READONLY, &h) != ESP_OK) return;
@@ -95,6 +143,7 @@ static void loadConfigFromNvs(EdgeConfig& cfg) {
     nvs_get_str(h, "pass", cfg.password, &sz);
     sz = sizeof(cfg.cameraUrl);
     nvs_get_str(h, "camera", cfg.cameraUrl, &sz);
+    normalizeCameraUrl(cfg.cameraUrl, sizeof(cfg.cameraUrl));
     sz = sizeof(cfg.scaleMac);
     nvs_get_str(h, "mac", cfg.scaleMac, &sz);
 
@@ -165,6 +214,8 @@ void saveFocalIfUnchanged(const EdgeConfig& original, float focal) {
 // =========================================================================
 static std::atomic<bool> s_wifi_ready{false};
 static std::atomic<bool> s_wifi_started{false};
+static char s_wifi_ip[16] = "no IP";
+static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void applyWifiPowerSave(bool active) {
     // Keep the station associated; MAX_MODEM uses the configured listen interval.
@@ -177,14 +228,29 @@ static void wifiEventHandler(void* arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_ready = false;
+        portENTER_CRITICAL(&s_ip_mux);
+        strcpy(s_wifi_ip, "no IP");
+        portEXIT_CRITICAL(&s_ip_mux);
         ESP_LOGW(TAG, "Wi-Fi disconnected; retrying in 2 seconds...");
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         auto* event = reinterpret_cast<ip_event_got_ip_t*>(event_data);
         ESP_LOGI(TAG, "Wi-Fi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        char ip[16];
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+        portENTER_CRITICAL(&s_ip_mux);
+        strcpy(s_wifi_ip, ip);
+        portEXIT_CRITICAL(&s_ip_mux);
         s_wifi_ready = true;
     }
+}
+
+void wifiIp(char* out, size_t size) {
+    if (!out || !size) return;
+    portENTER_CRITICAL(&s_ip_mux);
+    snprintf(out, size, "%s", s_wifi_ip);
+    portEXIT_CRITICAL(&s_ip_mux);
 }
 
 static void applyWifiConfig(const EdgeConfig& cfg) {
@@ -228,24 +294,6 @@ struct UsbPacketHeader {
 #pragma pack(pop)
 static SemaphoreHandle_t s_usb_tx_mutex = nullptr;
 
-static bool usbWriteAll(const void* buffer, size_t length, uint32_t timeoutMs) {
-    const auto* data = static_cast<const uint8_t*>(buffer);
-    const TickType_t started = xTaskGetTickCount();
-    const TickType_t timeout = pdMS_TO_TICKS(timeoutMs);
-    size_t offset = 0;
-    while (offset < length) {
-        const TickType_t elapsed = xTaskGetTickCount() - started;
-        if (elapsed >= timeout) return false;
-        // The default TX ring buffer is only 256 bytes. Larger writes fail
-        // atomically; bound every item and let the driver drain between items.
-        const size_t chunk = std::min(size_t(128), length - offset);
-        const int written = usb_serial_jtag_write_bytes(data + offset, chunk, timeout - elapsed);
-        if (written <= 0) return false;
-        offset += static_cast<size_t>(written);
-    }
-    return true;
-}
-
 static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev_crc = 0) {
     uint32_t crc = ~prev_crc;
     for (size_t i = 0; i < length; ++i) {
@@ -255,6 +303,30 @@ static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev
         }
     }
     return ~crc;
+}
+
+static bool usbWriteAll(const void* data, size_t length, uint32_t timeout_ms) {
+    const auto* ptr = static_cast<const uint8_t*>(data);
+    const uint32_t deadline = clockMs() + timeout_ms;
+    size_t sent = 0;
+    while (sent < length) {
+        // Chunk size must be <= usb_cfg.tx_buffer_size because ESP-IDF's
+        // xRingbufferSend immediately rejects any write larger than the ringbuffer.
+        const size_t chunk = std::min<size_t>(length - sent, 512);
+        const int32_t remain = static_cast<int32_t>(deadline - clockMs());
+        if (remain <= 0) return false;
+        // When a PC USB viewer is open, Windows drains 512 B in < 2 ms.
+        // If the ringbuffer stays full for 25 ms, no viewer is reading: abort immediately
+        // so the main loop never stalls when the USB viewer is closed.
+        const int n = usb_serial_jtag_write_bytes(
+            ptr + sent, chunk, pdMS_TO_TICKS(std::min<int32_t>(remain, 25)));
+        if (n > 0) {
+            sent += static_cast<size_t>(n);
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
@@ -292,10 +364,20 @@ static void processConfigLine(const std::string& line) {
         if (eq != std::string::npos) {
             const std::string key = line.substr(4, eq - 4);
             const std::string val = line.substr(eq + 1);
-            if (key == "ssid") strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
-            else if (key == "password") strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
-            else if (key == "camera") strncpy(s_staging_config.cameraUrl, val.c_str(), sizeof(s_staging_config.cameraUrl) - 1);
-            else if (key == "mac") strncpy(s_staging_config.scaleMac, val.c_str(), sizeof(s_staging_config.scaleMac) - 1);
+            if (key == "ssid") {
+                strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
+                s_staging_config.ssid[sizeof(s_staging_config.ssid) - 1] = '\0';
+            } else if (key == "password") {
+                strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
+                s_staging_config.password[sizeof(s_staging_config.password) - 1] = '\0';
+            } else if (key == "camera") {
+                strncpy(s_staging_config.cameraUrl, val.c_str(), sizeof(s_staging_config.cameraUrl) - 1);
+                s_staging_config.cameraUrl[sizeof(s_staging_config.cameraUrl) - 1] = '\0';
+                normalizeCameraUrl(s_staging_config.cameraUrl, sizeof(s_staging_config.cameraUrl));
+            } else if (key == "mac") {
+                strncpy(s_staging_config.scaleMac, val.c_str(), sizeof(s_staging_config.scaleMac) - 1);
+                s_staging_config.scaleMac[sizeof(s_staging_config.scaleMac) - 1] = '\0';
+            }
             else if (key == "mode") s_staging_config.groundMode = (val == "ground");
             else if (key == "distance") s_staging_config.distanceM = strtof(val.c_str(), nullptr);
             else if (key == "reference") s_staging_config.referenceCm = strtof(val.c_str(), nullptr);
@@ -344,6 +426,8 @@ static void usbReceiverTask(void* pvParameters) {
 static uint8_t s_lcd_addr = 0x21; // Default lab address
 static bool s_lcd_ready = false;
 static bool s_lcd_backlight = true; // Protected by s_lcd_mutex after init.
+static bool s_lcd_holding = false;
+static MeasurementView s_lcd_result;
 static char s_lcd_msg_first[17] = {};
 static char s_lcd_msg_second[17] = {};
 static uint32_t s_lcd_override_until = 0;
@@ -481,6 +565,14 @@ void lcdSetBacklight(bool on) {
     xSemaphoreGive(s_lcd_mutex);
 }
 
+void lcdHoldResult(const MeasurementView* result) {
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    s_lcd_holding = result && result->hasBMI;
+    if (s_lcd_holding) s_lcd_result = *result;
+    s_lcd_override_until = 0;
+    xSemaphoreGive(s_lcd_mutex);
+}
+
 static void lcdTask(void* pvParameters) {
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(250));
@@ -510,7 +602,7 @@ static void lcdTask(void* pvParameters) {
             continue;
         }
 
-        const auto view = stateSnapshot();
+        const auto view = s_lcd_holding ? s_lcd_result : stateSnapshot();
         const uint32_t phase = (clockMs() / 2500) % 2;
 
         if (view.status == PersonStatus::None) {
@@ -560,7 +652,7 @@ static std::atomic<bool> s_ble_standby{false};
 static std::atomic<bool> s_ble_synced{false};
 static std::atomic<unsigned> s_ble_scan_duty{0};
 
-unsigned bleScanDutyPercent() { return s_ble_scan_duty.load(); }
+float bleScanDutyPercent() { return s_ble_scan_duty.load() / 10.0f; }
 bool powerModeActive() { return s_power_active.load(); }
 
 static void configureCpuPower(bool active) {
@@ -649,7 +741,7 @@ void setPowerMode(bool active) {
         ESP_ERROR_CHECK(esp_pm_lock_release(s_active_cpu_lock));
         configureCpuPower(false);
     }
-    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%u%%", active ? "ACTIVE" : "STANDBY",
+    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%.1f%%", active ? "ACTIVE" : "STANDBY",
              bleScanDutyPercent());
 }
 
@@ -688,11 +780,12 @@ if (strcasecmp(receivedMac, cfg.scaleMac) != 0) {
                     const uint16_t raw_weight = (sd[2] << 8) | sd[1];
 
                     portENTER_CRITICAL(&s_state_mux);
+                    float kg = raw_weight / (is_lbs ? 100.0f : 200.0f);
+                    if (is_lbs) kg *= 0.45359237f;
+                    s_scale_presence.update(clockMs(), kg, is_stable, load_removed);
                     if (load_removed || raw_weight == 0) {
                         s_measurements.clearWeight();
                     } else {
-                        float kg = raw_weight / (is_lbs ? 100.0f : 200.0f);
-                        if (is_lbs) kg *= 0.45359237f;
                         s_measurements.weight(clockMs(), kg, is_stable);
                     }
                     portEXIT_CRITICAL(&s_state_mux);
@@ -706,6 +799,7 @@ if (strcasecmp(receivedMac, cfg.scaleMac) != 0) {
     return 0;
 }
 
+
 static void bleStartScan() {
     if (ble_gap_disc_active()) return;
     const bool standby = s_ble_standby.load();
@@ -716,9 +810,14 @@ static void bleStartScan() {
     // NimBLE units are 0.625 ms: 960 = 600 ms; active=100/100 ms.
     disc_params.itvl = standby ? 960 : 160;
     disc_params.window = standby ? (960 * EDGE_STANDBY_SCAN_PERCENT / 100) : 160;
+#ifndef EDGE_SCALE_ONLY
+    // Keep BLE listening during HTTP instead of cancelling discovery. Retain
+    // the camera branch's radio budget (25/200 ms), and validate it on hardware.
+    if (!standby) { disc_params.itvl = 320; disc_params.window = 40; }
+#endif
     const int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params,
                                bleGapEventHandler, nullptr);
-    if (rc == 0) s_ble_scan_duty.store(standby ? EDGE_STANDBY_SCAN_PERCENT : 100);
+    if (rc == 0) s_ble_scan_duty.store(1000U * disc_params.window / disc_params.itvl);
     else ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
 }
 
@@ -753,6 +852,8 @@ void edgeIoInit() {
     s_usb_tx_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_usb_tx_mutex ? ESP_OK : ESP_ERR_NO_MEM);
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_cfg.tx_buffer_size = 4096;
+    usb_cfg.rx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&usb_cfg);
     ESP_ERROR_CHECK(xTaskCreate(powerMonitorTask, "power_monitor", 2048, nullptr, 3, nullptr) == pdPASS
                     ? ESP_OK : ESP_ERR_NO_MEM);

@@ -3,10 +3,31 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "camera"))
-from usb_protocol import HEADER, Parser, config_commands, packet
+from usb_protocol import HEADER, Parser, SessionFilter, config_commands, packet
 
 
 class USBProtocolTests(unittest.TestCase):
+    def test_session_filter_rejects_departed_and_previous_person_frames(self):
+        sessions = SessionFilter()
+        self.assertTrue(sessions.accept({"kind": "frame"}))  # Legacy firmware.
+        self.assertTrue(sessions.accept({"kind": "scale", "session_id": 1, "phase": "ACTIVE"}))
+        self.assertTrue(sessions.accept({"kind": "frame", "session_id": 1}))
+        self.assertTrue(sessions.accept({"kind": "scale", "session_id": 2, "phase": "DRAINING"}))
+        self.assertFalse(sessions.accept({"kind": "frame", "session_id": 1}))
+        self.assertFalse(sessions.accept({"kind": "frame", "session_id": 2}))
+        self.assertTrue(sessions.accept({"kind": "scale", "session_id": 2, "phase": "RESULT_HOLD"}))
+        self.assertTrue(sessions.accept({"kind": "frame", "session_id": 3}))
+        self.assertFalse(sessions.accept({"kind": "scale", "session_id": 2, "phase": "STANDBY"}))
+
+    def test_session_filter_handles_generation_rollover(self):
+        sessions = SessionFilter()
+        self.assertTrue(sessions.accept({"kind": "frame", "session_id": 0xffffffff}))
+        self.assertTrue(sessions.accept({"kind": "frame", "session_id": 0}))
+        self.assertFalse(sessions.accept({"kind": "frame", "session_id": 0xffffffff}))
+        self.assertTrue(sessions.accept({"kind": "frame", "session_id": 40}))
+        self.assertTrue(sessions.accept({"kind": "boot"}))
+        self.assertTrue(sessions.accept({"kind": "scale", "session_id": 0, "phase": "STANDBY"}))
+
     def test_split_reads_and_noise(self):
         stream = b"boot noise" + packet({"kind": "frame", "height_cm": 183}, b"jpeg")
         parser = Parser()

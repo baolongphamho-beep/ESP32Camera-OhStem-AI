@@ -4,10 +4,12 @@ param(
     [string]$Port,
     [switch]$Flash,
     [switch]$ScaleOnly,
+    [switch]$CameraContinuous,
     [ValidateSet(10, 25, 50, 100)]
     [int]$StandbyScanPercent = 10
 )
 $ErrorActionPreference = 'Stop'
+if ($ScaleOnly -and $CameraContinuous) { throw 'Choose either -ScaleOnly or -CameraContinuous.' }
 
 # Auto-detect Espressif root if not explicitly provided
 if (!$EspressifRoot) {
@@ -71,22 +73,49 @@ if (Test-Path -LiteralPath $eimProfile) {
 }
 Push-Location $PSScriptRoot
 try {
-    # Defaults do not override an existing sdkconfig. Migrate only the PM keys
-    # this firmware requires, preserving every other generated setting.
+    # Ensure ESP-DL YOLO26 component sources exist (auto-bootstrap on a new PC).
+    $yoloCandidates = @(
+        (Join-Path $PSScriptRoot '../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
+        (Join-Path $PSScriptRoot '../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
+        (Join-Path $PSScriptRoot '../../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt')
+    )
+    $foundYolo = $false
+    foreach ($c in $yoloCandidates) {
+        if (Test-Path -LiteralPath $c) { $foundYolo = $true; break }
+    }
+    if (!$foundYolo) {
+        Write-Host "[SmartScale] Bootstrapping ESP-DL sources for first-time setup..." -ForegroundColor Yellow
+        & (Join-Path $PSScriptRoot 'tools/prepare_sources.ps1')
+    }
+
+    # Migrate only the PM and camera-performance settings required by this
+    # integration. Preserve other generated settings rather than deleting them.
     $pmKeys = @('CONFIG_PM_ENABLE', 'CONFIG_PM_PROFILING',
         'CONFIG_FREERTOS_USE_TICKLESS_IDLE', 'CONFIG_BT_CTRL_MODEM_SLEEP',
         'CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1', 'CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL',
         'CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP')
+    $requiredValues = @{}
+    foreach ($key in $pmKeys) { $requiredValues[$key] = 'y' }
+    $cameraKeys = @('CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240', 'CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ',
+        'CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM', 'CONFIG_ESP_WIFI_RX_BA_WIN',
+        'CONFIG_LWIP_IRAM_OPTIMIZATION', 'CONFIG_LWIP_TCP_SND_BUF_DEFAULT',
+        'CONFIG_LWIP_TCP_WND_DEFAULT', 'CONFIG_LWIP_TCP_RECVMBOX_SIZE')
+    foreach ($line in [IO.File]::ReadAllLines((Join-Path $PSScriptRoot 'sdkconfig.defaults'))) {
+        if ($line -match '^(CONFIG_[A-Z0-9_]+)=(.+)$' -and $cameraKeys -contains $Matches[1]) {
+            $requiredValues[$Matches[1]] = $Matches[2]
+        }
+    }
     $sdkconfigPath = Join-Path $PSScriptRoot 'sdkconfig'
     if (Test-Path -LiteralPath $sdkconfigPath) {
         $configText = [IO.File]::ReadAllText($sdkconfigPath)
         $originalText = $configText
-        foreach ($key in $pmKeys) {
+        foreach ($key in $requiredValues.Keys) {
+            $value = $requiredValues[$key]
             $pattern = '(?m)^(?:# ' + [regex]::Escape($key) + ' is not set|' + [regex]::Escape($key) + '=.*)\r?$'
             if ($configText -match $pattern) {
-                $configText = [regex]::Replace($configText, $pattern, "$key=y")
+                $configText = [regex]::Replace($configText, $pattern, "$key=$value")
             } else {
-                $configText += "`r`n$key=y`r`n"
+                $configText += "`r`n$key=$value`r`n"
             }
         }
         if ($configText -ne $originalText) {
@@ -94,7 +123,8 @@ try {
         }
     }
     $scaleOnlyValue = if ($ScaleOnly) { 'ON' } else { 'OFF' }
-    idf.py -D IDF_TARGET=esp32s3 -D "SMARTSCALE_SCALE_ONLY=$scaleOnlyValue" -D "SMARTSCALE_STANDBY_SCAN_PERCENT=$StandbyScanPercent" build
+    $continuousValue = if ($CameraContinuous) { 'ON' } else { 'OFF' }
+    idf.py -D IDF_TARGET=esp32s3 -D "SMARTSCALE_SCALE_ONLY=$scaleOnlyValue" -D "SMARTSCALE_CAMERA_CONTINUOUS=$continuousValue" -D "SMARTSCALE_STANDBY_SCAN_PERCENT=$StandbyScanPercent" build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if ($Flash) {
         if (!$Port) { throw 'Specify -Port COMx to flash the YOLO UNO (e.g. -Port COM9).' }
