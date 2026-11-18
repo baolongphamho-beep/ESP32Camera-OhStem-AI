@@ -287,4 +287,4 @@ Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toà
 
 ---
 
-*Tài liệu thuộc dự án **SmartScale — Hệ Thống Đo Nhân Trắc Tự Động**, phát triển bởi nhóm ACLAB.*
+*Tài liệu thuộc dự án **SmartScale — Hệ Thống Đo Nhân Trắc Tự Động**, phát triển bởi nhóm 6 thuộc ACLAB.*
