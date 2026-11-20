@@ -1,3 +1,5 @@
+> **Bàn giao mã và tài liệu TV5 — 20/11/2026.** Nhánh đã có viewer/config, ResultHold, định dạng LCD thuần C++, công cụ QA và test TV5. Chưa đưa firmware servo/preview native và model 192 của LAB lên; các lệnh cho firmware đó cần bản LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+
 # Kế Hoạch 2: Thảo Luận & Phân Chia Công Việc Cho Nhóm 5 Người
 
 Tài liệu này dùng cho buổi họp nhóm thống nhất kiến trúc và phân chia công việc song song cho **5 thành viên** nhằm nâng cấp hệ thống **SmartScale (`firmware/edge_yolo`)** với 2 tính năng mới:
