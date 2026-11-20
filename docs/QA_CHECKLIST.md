@@ -1,4 +1,4 @@
-> **Bàn giao tài liệu TV5 — 20/11/2026.** Nội dung mô tả bản phát triển trong LAB. Nhánh này chỉ bổ sung tài liệu, chưa đưa mã TV5/model 192 lên GitHub; các lệnh dùng tính năng mới cần bản mã LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+> **Bàn giao mã và tài liệu TV5 — 20/11/2026.** Nhánh đã có viewer/config, ResultHold, định dạng LCD thuần C++, công cụ QA và test TV5. Chưa đưa firmware servo/preview native và model 192 của LAB lên; các lệnh cho firmware đó cần bản LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
 
 # QA Checklist – Plan 2 (servo quét + cân Mi + BMI)
 
@@ -23,7 +23,7 @@ powershell -ExecutionPolicy Bypass -File tools\run_all_tests.ps1 -Firmware  # th
 ```
 Yêu cầu: dòng cuối phải là `0 FAIL`. Source `firmware/edge_yolo/main/` đã có, không bỏ qua `edge_geometry` vì lý do thiếu source cũ. Thiếu compiler/thư viện là thiếu môi trường kiểm chứng, không phải PASS.
 
-Script này còn tự chạy **bộ mô phỏng QA** (tests/qa_log_sim.cpp (thuộc bản mã LAB)). Nó sinh ra log giống hệt firmware thật cho 17 lượt đo, rồi cho tools/qa_log_check.py (thuộc bản mã LAB) chấm. Nếu bước này PASS thì công cụ chấm log đang chạy đúng.
+Script này còn tự chạy **bộ mô phỏng QA** ([tests/qa_log_sim.cpp](../tests/qa_log_sim.cpp)). Nó sinh ra log giống hệt firmware thật cho 17 lượt đo, rồi cho [tools/qa_log_check.py](../tools/qa_log_check.py) chấm. Nếu bước này PASS thì công cụ chấm log đang chạy đúng.
 
 | Ca QA | Đã có kiểm tra tự động trên PC tại |
 |---|---|

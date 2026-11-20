@@ -1,4 +1,4 @@
-> **Tài liệu TV5 (bản bàn giao 20/11/2026):** [Nội dung đã làm và cách dùng](docs/TV5_INDEPENDENT_WORK.md) · [Checklist QA](docs/QA_CHECKLIST.md) · [Workflow Wi-Fi/configure](docs/WORKFLOW_WIFI_CONFIGURE.md). Nhánh này chỉ đưa tài liệu lên; mã và model TV5 chưa được phát hành cùng nhánh.
+> **Mã và tài liệu TV5 (20/11/2026):** [Nội dung đã làm và cách dùng](docs/TV5_INDEPENDENT_WORK.md) · [Checklist QA](docs/QA_CHECKLIST.md) · [Workflow Wi-Fi/configure](docs/WORKFLOW_WIFI_CONFIGURE.md). Code: [viewer](camera/usb_viewer.py), [protocol](camera/usb_protocol.py), [telemetry](camera/telemetry.py), [ResultHold](lib/Measurements/measurement_state.h), [LCD formatter](lib/EdgeSweep/edge_io.h), [QA native](tools/native_qa.py), [test runner](tools/run_tv5_tests.py). Firmware servo/preview native và model 192 của LAB chưa nằm trong PR.
 
 # SmartScale — Hệ Thống Đo Nhân Trắc Tự Động (AI + Cân BLE + LCD)
 

@@ -1,4 +1,4 @@
-> **Bàn giao tài liệu TV5 — 20/11/2026.** Nội dung mô tả bản phát triển trong LAB. Nhánh này chỉ bổ sung tài liệu, chưa đưa mã TV5/model 192 lên GitHub; các lệnh dùng tính năng mới cần bản mã LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+> **Bàn giao mã và tài liệu TV5 — 20/11/2026.** Nhánh đã có viewer/config, ResultHold, định dạng LCD thuần C++, công cụ QA và test TV5. Chưa đưa firmware servo/preview native và model 192 của LAB lên; các lệnh cho firmware đó cần bản LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
 
 # Đối chiếu cập nhật cân trên GitHub và công việc TV5 — 19/11/2026
 

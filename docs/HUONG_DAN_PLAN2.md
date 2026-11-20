@@ -1,4 +1,4 @@
-> **Bàn giao tài liệu TV5 — 20/11/2026.** Nội dung mô tả bản phát triển trong LAB. Nhánh này chỉ bổ sung tài liệu, chưa đưa mã TV5/model 192 lên GitHub; các lệnh dùng tính năng mới cần bản mã LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+> **Bàn giao mã và tài liệu TV5 — 20/11/2026.** Nhánh đã có viewer/config, ResultHold, định dạng LCD thuần C++, công cụ QA và test TV5. Chưa đưa firmware servo/preview native và model 192 của LAB lên; các lệnh cho firmware đó cần bản LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
 
 # Hướng dẫn lắp đặt – hiệu chuẩn – vận hành (Plan 2)
 
@@ -41,7 +41,7 @@ Thời gian dự kiến: lắp đặt 30 phút, hiệu chuẩn 20 phút, kiểm 
 | File chính | Vai trò |
 |---|---|
 | src/app_main.cpp (thuộc bản mã LAB) | Chương trình chính trên UNO |
-| lib/EdgeSweep/ (thuộc bản mã LAB) | `edge_config.h` (thông số), `edge_geometry.h` (hình học), `edge_fsm.h` (máy trạng thái), `servo_ctrl.*` (servo), `edge_io.*` (LCD) |
+| [lib/EdgeSweep/](../lib/EdgeSweep/) | `edge_config.h` (thông số), `edge_geometry.h` (hình học), `edge_fsm.h` (máy trạng thái), `servo_ctrl.*` (servo), `edge_io.*` (LCD) |
 | vision/body_tracker.py (thuộc bản mã LAB) | Laptop chạy YOLO tìm người |
 | [camera/usb_viewer.py](../camera/usb_viewer.py) | Cấu hình UNO qua USB và xem trạng thái |
 

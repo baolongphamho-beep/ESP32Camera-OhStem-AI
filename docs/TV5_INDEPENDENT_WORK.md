@@ -1,4 +1,4 @@
-> **Bàn giao tài liệu TV5 — 20/11/2026.** Nội dung mô tả bản phát triển trong LAB. Nhánh này chỉ bổ sung tài liệu, chưa đưa mã TV5/model 192 lên GitHub; các lệnh dùng tính năng mới cần bản mã LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+> **Bàn giao mã và tài liệu TV5 — 20/11/2026.** Nhánh đã có viewer/config, ResultHold, định dạng LCD thuần C++, công cụ QA và test TV5. Chưa đưa firmware servo/preview native và model 192 của LAB lên; các lệnh cho firmware đó cần bản LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
 
 # Phần TV5 làm độc lập — 19/11/2026
 
@@ -72,3 +72,25 @@ Exit code: `0` không thấy lỗi trong dữ liệu/ngưỡng đã kiểm (có 
 `tools/run_all_tests.ps1`: **13 PASS, 0 FAIL, 0 SKIP**; 10 chương trình C++, **83 test Python chính + 3 integration**, và QA checker Arduino trên log mô phỏng. Log `.edge-deps/tv5-independent-tests-20261119.log`. Lệnh mẫu native QA đã xuất JSON/CSV trong `.edge-deps/qa/`; dữ liệu mẫu được gắn nhãn synthetic.
 
 Không sửa thư viện firmware/servo/cân trong bước này; không cần nạp lại UNO chỉ để dùng `--log` và công cụ phân tích mới. Bản `qa_log_check.py` cũ vẫn dành cho Arduino, không đổi schema cũ.
+
+## 7. Mã bàn giao lên GitHub (20/11/2026)
+
+PR TV5 đã được bổ sung source thay cho chỉ có tài liệu. Các nhóm file chính:
+
+- `camera/usb_viewer.py`, `usb_protocol.py`, `telemetry.py`, `power_monitor.py`: viewer/config, session filtering, diagnostics và recorder.
+- `lib/Measurements/measurement_state.h`, `scale_presence.h`: ResultHold và cân độc lập camera.
+- `lib/EdgeSweep/edge_io.h`: bộ định dạng LCD thuần C++; các header config/FSM/geometry/message/servo interface/USB cùng thư mục là phụ thuộc để biên dịch và mô phỏng. Chưa đưa driver `.cpp` hoặc ứng dụng điều khiển servo vào lần bàn giao này.
+- `tools/native_probe.py`, `native_qa.py`, `qa_log_check.py`, `run_tv5_tests.py` và `tests/`: công cụ và kiểm thử chạy trên PC.
+
+Sau khi tải đúng nhánh PR, tạo môi trường Python và cài `camera/requirements-usb.txt`, rồi chạy:
+
+```powershell
+python -m pip install -r camera/requirements-usb.txt
+python tools/run_tv5_tests.py
+# Nếu g++ chưa có trên PATH, truyền vị trí thực tế, ví dụ máy LAB:
+python tools/run_tv5_tests.py --cxx C:\msys64\ucrt64\bin\g++.exe
+```
+
+Đã chạy kiểm tra ngay trên cây mã chuẩn bị push: **76 test Python, 6 chương trình C++ và QA log mô phỏng đạt**, không có test bị bỏ qua. Số này khác 83 test của toàn bộ LAB ở mục 6 vì PR chỉ mang các phần cần cho TV5 cộng baseline upstream. Runner báo lỗi nếu thiếu compiler hoặc thư viện khiến test bị skip.
+
+Phần `firmware/edge_yolo/main` trong nhánh vẫn là baseline cân/camera upstream, **chưa phải firmware servo/preview/model 192 đang chạy tại LAB**. Vì vậy `--preview`, `-ModelSize 192` và các hướng dẫn nạp bản nhanh cần firmware LAB tương ứng; không suy ra clone nhánh này đã có firmware đó. Không đưa model, mật khẩu, dump flash hoặc môi trường Python vào commit. PR vẫn cần chủ repo xem xét; chưa gộp vào nhánh nhóm.
