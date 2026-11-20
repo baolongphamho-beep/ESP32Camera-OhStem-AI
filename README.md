@@ -1,3 +1,5 @@
+> **Tài liệu TV5 (bản bàn giao 20/11/2026):** [Nội dung đã làm và cách dùng](docs/TV5_INDEPENDENT_WORK.md) · [Checklist QA](docs/QA_CHECKLIST.md) · [Workflow Wi-Fi/configure](docs/WORKFLOW_WIFI_CONFIGURE.md). Nhánh này chỉ đưa tài liệu lên; mã và model TV5 chưa được phát hành cùng nhánh.
+
 # SmartScale — Hệ Thống Đo Nhân Trắc Tự Động (AI + Cân BLE + LCD)
 
 > **Nhánh tích hợp camera + TV2:** xem [hướng dẫn tích hợp và ba chế độ build](docs/CAMERA_POWER_INTEGRATION.md). Mặc định đánh thức camera/AI từ cân; dùng `-CameraContinuous` để kiểm chuẩn camera + cân liên tục, hoặc `-ScaleOnly` để thử riêng cân/LCD/nguồn. Build/unit test không thay cho kiểm chứng camera thật và hiệu chuẩn tại chỗ.

@@ -1,3 +1,5 @@
+> **Bàn giao tài liệu TV5 — 20/11/2026.** Nội dung mô tả bản phát triển trong LAB. Nhánh này chỉ bổ sung tài liệu, chưa đưa mã TV5/model 192 lên GitHub; các lệnh dùng tính năng mới cần bản mã LAB tương ứng. Kết quả kiểm thử PC không thay cho nghiệm thu cân/servo thật.
+
 # Kế Hoạch 2: Thảo Luận & Phân Chia Công Việc Cho Nhóm 5 Người
 
 Tài liệu này dùng cho buổi họp nhóm thống nhất kiến trúc và phân chia công việc song song cho **5 thành viên** nhằm nâng cấp hệ thống **SmartScale (`firmware/edge_yolo`)** với 2 tính năng mới:
