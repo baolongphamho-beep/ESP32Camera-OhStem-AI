@@ -49,7 +49,7 @@ def configure():
     if ssid:
         values["ssid"] = ssid
         values["password"] = input("WiFi password (khong ghi file): ")
-    url = input("URL hoac IP camera (Enter = giu nguyen, vi du http://10.127.7.68/capture): ").strip()
+    url = input("URL hoac IP camera (Enter = giu nguyen, vi du http://172.20.10.2/capture): ").strip()
     if url:
         if not url.startswith(("http://", "https://")):
             url = "http://" + url

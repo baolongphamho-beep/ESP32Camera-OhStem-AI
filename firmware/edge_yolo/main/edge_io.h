@@ -9,7 +9,7 @@
 struct EdgeConfig {
     char ssid[33] = {};
     char password[65] = {};
-    char cameraUrl[160] = "http://10.127.7.68/capture";
+    char cameraUrl[160] = "http://172.20.10.2/capture";
     char scaleMac[18] = "70:87:9e:ea:3a:e0";
     float distanceM = 3;
     float referenceCm = 183;

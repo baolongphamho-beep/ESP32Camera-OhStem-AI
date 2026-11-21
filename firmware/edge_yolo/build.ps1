@@ -63,6 +63,14 @@ Write-Host "[SmartScale] Using ESP-IDF from: $IDFPath" -ForegroundColor Cyan
 Write-Host "[SmartScale] Using IDF Tools from: $env:IDF_TOOLS_PATH" -ForegroundColor Cyan
 
 $env:PYTHONUTF8 = '1'
+# A viewer venv inherited by this process carries _OLD_VIRTUAL_PATH. EIM adds
+# toolchain directories before Activate.ps1, whose deactivate step would then
+# restore that old PATH and silently remove the compiler directories again.
+# Restore it before loading EIM so its additions survive Python activation.
+if (Test-Path Env:_OLD_VIRTUAL_PATH) {
+    $env:PATH = $env:_OLD_VIRTUAL_PATH
+    Remove-Item Env:_OLD_VIRTUAL_PATH
+}
 # EIM installations use a version-specific profile with their tool paths.
 $versionName = Split-Path (Split-Path $IDFPath -Parent) -Leaf
 $eimProfile = Join-Path $EspressifRoot "tools/Microsoft.$versionName.PowerShell_profile.ps1"
@@ -70,6 +78,9 @@ if (Test-Path -LiteralPath $eimProfile) {
     . $eimProfile
 } else {
     . $exportScript
+}
+if (!(Get-Command xtensa-esp32s3-elf-gcc -ErrorAction SilentlyContinue)) {
+    throw 'ESP32-S3 compiler is missing from PATH after ESP-IDF activation. Check the selected ESP-IDF toolchain installation.'
 }
 Push-Location $PSScriptRoot
 try {

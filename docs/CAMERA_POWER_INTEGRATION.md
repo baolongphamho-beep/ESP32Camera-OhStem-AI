@@ -19,6 +19,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1
 
 `-ScaleOnly` và `-CameraContinuous` loại trừ nhau. Không truyền cả hai thì chọn chế độ tích hợp. `-StandbyScanPercent` hỗ trợ 10/25/50/100; thay đổi mức quét cần build/nạp lại. Bản chỉ cân quét ACTIVE 100%; bản có camera quét ACTIVE 25 ms mỗi 200 ms = 12.5%, liên tục duy trì BLE giữa các lần tải ảnh thay vì dừng discovery suốt HTTP. Cần kiểm tra lại độ tin cậy LOCK/bước xuống và tốc độ camera trên phần cứng; chưa xem mức này là cấu hình RF tối ưu.
 
+Script build xử lý `_OLD_VIRTUAL_PATH` trước khi nạp môi trường EIM để có thể
+chạy từ Terminal đang kích hoạt `.venv-camera`. Nếu trước đây CMake báo không
+tìm thấy `xtensa-esp32s3-elf-gcc`, chạy lại bằng script đã sửa. Build thất bại
+thì chưa có firmware mới được nạp; mở Viewer vẫn có thể nhận dữ liệu từ bản cũ.
+
 ## Luồng tích hợp
 
 1. Khởi tạo model một lần và giữ tài nguyên model cho các lượt sau.
@@ -50,6 +55,65 @@ g++ -std=c++17 -I lib/Measurements tests/measurement_state_test.cpp -o .pio/meas
 ```
 
 Các ca mới gồm: không ngủ khi HTTP/inference chưa kết thúc, bỏ ảnh sau bước xuống, đổi người nhanh giữa hai poll, camera mất người không xóa tải cân, timeout và tràn bộ đếm thời gian, viewer loại ảnh cũ và generation rollover.
+
+### BLE scan retry
+
+Khi bắt đầu scan lỗi tạm thời, `edge_io.cpp` hẹn retry bằng NimBLE callout:
+100, 200, 400, 800, 1600 rồi tối đa 2000 ms (cộng một tick để không chạy sớm).
+Thành công thì hủy retry và reset backoff. `EINVAL` / `ENOTSUP` báo lỗi cấu hình
+và không tự retry. Start/cancel và callback retry chạy trên cùng hàng đợi host;
+yêu cầu đổi Active/Standby dùng chế độ mong muốn mới nhất. Không đổi duty cycle.
+Nếu cancel khi đổi chế độ thất bại, cũng hẹn xử lý lại thay vì bỏ yêu cầu.
+
+```powershell
+g++ -std=c++17 -Wall -Wextra -Werror -I firmware/edge_yolo/main tests/ble_scan_retry_test.cpp -o "$env:TEMP/ble_scan_retry_test.exe"
+& "$env:TEMP/ble_scan_retry_test.exe"
+```
+
+Test đồng hồ giả kiểm tra deadline/backoff, hai lần thất bại rồi thành công,
+hủy/thay deadline cũ và tràn bộ đếm. Test này chưa mô phỏng radio hoặc scheduler
+NimBLE. Khi có bo, cần ép lỗi start có kiểm soát để xác nhận tự phục hồi, đồng
+thời thử đổi Active/Standby trong lúc chờ retry. Phục hồi BLE host reset chưa
+thuộc thay đổi này.
+
+### Wi-Fi reconnect không chặn event loop
+
+`wifiEventHandler()` không delay khi mất mạng. Timer một lần sau 2 giây chỉ
+post sự kiện; `esp_wifi_connect()` và cập nhật cấu hình chạy trên default event
+loop. STA_CONNECTED/GOT_IP hủy retry. Khi đổi SSID/password, dừng Wi-Fi, bỏ qua
+sự kiện cũ trong lúc chờ STA_STOP rồi áp dụng cấu hình mới nhất. SSID rỗng dừng
+Wi-Fi và không retry. Timer event cũ phải qua kiểm tra deadline hiện tại, không
+được kết nối sớm hoặc tạo thêm một yêu cầu sau khi đã kết nối.
+
+```powershell
+g++ -std=c++17 -Wall -Wextra -Werror -I firmware/edge_yolo/main tests/wifi_reconnect_test.cpp -o "$env:TEMP/wifi_reconnect_test.exe"
+& "$env:TEMP/wifi_reconnect_test.exe"
+```
+
+Test này kiểm tra policy thời gian/cancel, không mô phỏng driver hoặc thứ tự
+sự kiện STA_STOP trên bo. Kiểm thử thật: tắt/bật lại AP, đổi SSID/password qua
+USB khi retry đang chờ, kiểm tra IP mới và ảnh camera trở lại; đồng thời kiểm
+tra cân/LCD vẫn phản hồi.
+
+### Kiểm tra thông tin Wi-Fi
+
+`wifi_credentials.h` kiểm tra thông tin trước khi lưu NVS và trước khi áp dụng
+cho driver. Mật khẩu trống chọn `WIFI_AUTH_OPEN`; có mật khẩu giữ ngưỡng tối
+thiểu `WIFI_AUTH_WPA2_PSK`. Chưa thêm hỗ trợ mạng chỉ dùng WPA1.
+SSID tối đa 32 byte, passphrase 8-63 byte hoặc khóa PSK 64 ký tự hex. Sao chép
+đủ các byte vào mảng driver, không cắt ký tự cuối ở độ dài tối đa. Chuỗi ngắn
+được đệm zero; không ghi thêm NUL vượt mảng khi chuỗi đầy. USB từ chối cả giao
+dịch khi thông tin sai, không ghi NVS hoặc đổi kết nối hiện tại. Không log mật
+khẩu. Độ dài tính bằng byte UTF-8, không phải số ký tự hiển thị.
+
+```powershell
+g++ -std=c++17 -Wall -Wextra -Werror -I firmware/edge_yolo/main tests/wifi_credentials_test.cpp -o "$env:TEMP/wifi_credentials_test.exe"
+& "$env:TEMP/wifi_credentials_test.exe"
+```
+
+Test bao gồm mạng mở, passphrase, biên 32/63/64 byte, hex không hợp lệ, UTF-8,
+NUL và xóa phần dư khi đổi từ chuỗi dài sang ngắn. Kết nối mạng mở/SSID dài/PSK
+hex trên driver thật vẫn cần thử trên bo.
 
 ## Checklist chạy thật
 

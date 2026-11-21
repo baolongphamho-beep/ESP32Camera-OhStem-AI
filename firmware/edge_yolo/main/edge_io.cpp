@@ -1,4 +1,7 @@
 #include "edge_io.h"
+#include "ble_scan_retry.h"
+#include "wifi_reconnect.h"
+#include "wifi_credentials.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -113,6 +116,7 @@ static EdgeConfig s_config;
 static SemaphoreHandle_t s_config_mutex = nullptr;
 static bool s_in_config_session = false;
 static EdgeConfig s_staging_config;
+static bool s_wifi_config_invalid = false;
 
 static void normalizeCameraUrl(char* url, size_t cap) {
     if (!url || !url[0]) return;
@@ -216,25 +220,140 @@ static std::atomic<bool> s_wifi_ready{false};
 static std::atomic<bool> s_wifi_started{false};
 static char s_wifi_ip[16] = "no IP";
 static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
+ESP_EVENT_DEFINE_BASE(EDGE_WIFI_CONTROL);
+enum { WIFI_CONTROL_CONFIG, WIFI_CONTROL_RETRY };
+static esp_timer_handle_t s_wifi_retry_timer = nullptr;
+static WifiReconnect s_wifi_reconnect;
+static wifi_config_t s_wifi_desired_config = {};
+static bool s_wifi_waiting_stop = false;
+
+static void wifiClearReady() {
+    s_wifi_ready.store(false);
+    portENTER_CRITICAL(&s_ip_mux);
+    strcpy(s_wifi_ip, "no IP");
+    portEXIT_CRITICAL(&s_ip_mux);
+}
+
+static void wifiCancelRetry() {
+    s_wifi_reconnect.cancel();
+    esp_timer_stop(s_wifi_retry_timer); // An inactive timer is harmless.
+}
+
+static void wifiRetryTimer(void*) {
+    // Never connect or wait on the system timer task. A stale wakeup is checked
+    // against the current policy/deadline when the event loop receives it.
+    if (esp_event_post(EDGE_WIFI_CONTROL, WIFI_CONTROL_RETRY, nullptr, 0, 0) != ESP_OK) {
+        // Queue full: preserve recovery without blocking this timer callback.
+        // INVALID_STATE means a newer retry has already armed this timer.
+        esp_timer_start_once(s_wifi_retry_timer, 100000);
+    }
+}
+
+static void wifiArmRetry() {
+    if (!s_wifi_reconnect.pending()) return;
+    esp_timer_stop(s_wifi_retry_timer);
+    const uint32_t wait = std::max<uint32_t>(1, s_wifi_reconnect.remaining(clockMs()));
+    const esp_err_t rc = esp_timer_start_once(s_wifi_retry_timer, uint64_t(wait) * 1000);
+    // A queue-full timer callback can rearm concurrently. Its earlier wakeup
+    // is safe: the event loop checks the deadline again before connecting.
+    ESP_ERROR_CHECK(rc == ESP_ERR_INVALID_STATE ? ESP_OK : rc);
+}
+
+static void wifiScheduleRetry() {
+    s_wifi_reconnect.disconnected(clockMs());
+    wifiArmRetry();
+}
+
+static void wifiConnectNow() {
+    if (!s_wifi_reconnect.enabled() || s_wifi_waiting_stop || !s_wifi_started.load()) return;
+    wifiCancelRetry();
+    const esp_err_t rc = esp_wifi_connect();
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi connect failed: %s; retry in 2 seconds", esp_err_to_name(rc));
+        wifiScheduleRetry();
+    }
+}
 
 static void applyWifiPowerSave(bool active) {
     // Keep the station associated; MAX_MODEM uses the configured listen interval.
     ESP_ERROR_CHECK(esp_wifi_set_ps(active ? WIFI_PS_NONE : WIFI_PS_MAX_MODEM));
 }
 
+static void wifiStartDesiredConfig() {
+    if (!s_wifi_reconnect.enabled()) return;
+    esp_err_t rc = esp_wifi_set_config(WIFI_IF_STA, &s_wifi_desired_config);
+    if (rc == ESP_OK) {
+        applyWifiPowerSave(s_power_active.load());
+        rc = esp_wifi_start();
+    }
+    s_wifi_started.store(rc == ESP_OK);
+    if (rc != ESP_OK) ESP_LOGE(TAG, "Wi-Fi start failed: %s", esp_err_to_name(rc));
+}
+
 static void wifiEventHandler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+    if (event_base == EDGE_WIFI_CONTROL && event_id == WIFI_CONTROL_CONFIG) {
+        const auto& cfg = *static_cast<const EdgeConfig*>(event_data);
+        WifiCredentials credentials;
+        const char* error = prepareWifiCredentials(
+            std::string_view(cfg.ssid, strnlen(cfg.ssid, sizeof(cfg.ssid))),
+            std::string_view(cfg.password, strnlen(cfg.password, sizeof(cfg.password))), credentials);
+        if (error) {
+            ESP_LOGE(TAG, "Wi-Fi configuration rejected: %s", error);
+            return; // Preserve the current connection for an invalid request.
+        }
+        wifiCancelRetry();
+        wifiClearReady();
+        s_wifi_reconnect.enable(cfg.ssid[0] != '\0');
+        if (!s_wifi_reconnect.enabled()) {
+            ESP_LOGW(TAG, "No Wi-Fi SSID configured; waiting for USB configuration");
+        }
+        s_wifi_desired_config = {};
+        static_assert(sizeof(s_wifi_desired_config.sta.ssid) == credentials.ssid.size());
+        static_assert(sizeof(s_wifi_desired_config.sta.password) == credentials.password.size());
+        memcpy(s_wifi_desired_config.sta.ssid, credentials.ssid.data(), credentials.ssid.size());
+        memcpy(s_wifi_desired_config.sta.password, credentials.password.data(), credentials.password.size());
+        s_wifi_desired_config.sta.threshold.authmode = credentials.open ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+        s_wifi_desired_config.sta.listen_interval = 3;
+        if (s_wifi_waiting_stop) return; // Keep the newest config until STOP.
+        if (s_wifi_started.load()) {
+            // STOP is an event-ordering fence: old disconnect/start events are
+            // ignored until it arrives, then only the newest config is started.
+            s_wifi_waiting_stop = true;
+            const esp_err_t rc = esp_wifi_stop();
+            if (rc != ESP_OK) {
+                s_wifi_waiting_stop = false;
+                s_wifi_reconnect.enable(false);
+                ESP_LOGE(TAG, "Wi-Fi stop for configuration failed: %s", esp_err_to_name(rc));
+            }
+        } else {
+            wifiStartDesiredConfig();
+        }
+    } else if (event_base == EDGE_WIFI_CONTROL && event_id == WIFI_CONTROL_RETRY) {
+        if (s_wifi_reconnect.due(clockMs())) wifiConnectNow();
+        else wifiArmRetry(); // An old timer event must not connect early.
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+        s_wifi_started.store(false);
+        wifiCancelRetry();
+        wifiClearReady();
+        if (s_wifi_waiting_stop) {
+            s_wifi_waiting_stop = false;
+            wifiStartDesiredConfig();
+        } else {
+            s_wifi_reconnect.enable(false);
+        }
+    } else if (s_wifi_waiting_stop || !s_wifi_reconnect.enabled()) {
+        return;
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        wifiConnectNow();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        wifiCancelRetry(); // Associated: wait for DHCP, do not start another connect.
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_ready = false;
-        portENTER_CRITICAL(&s_ip_mux);
-        strcpy(s_wifi_ip, "no IP");
-        portEXIT_CRITICAL(&s_ip_mux);
+        wifiClearReady();
         ESP_LOGW(TAG, "Wi-Fi disconnected; retrying in 2 seconds...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_wifi_connect();
+        wifiScheduleRetry();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifiCancelRetry();
         auto* event = reinterpret_cast<ip_event_got_ip_t*>(event_data);
         ESP_LOGI(TAG, "Wi-Fi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
         char ip[16];
@@ -254,27 +373,10 @@ void wifiIp(char* out, size_t size) {
 }
 
 static void applyWifiConfig(const EdgeConfig& cfg) {
-    if (cfg.ssid[0] == '\0') {
-        ESP_LOGW(TAG, "No Wi-Fi SSID configured; waiting for USB configuration");
-        return;
-    }
-    wifi_config_t wifi_cfg = {};
-    memset(wifi_cfg.sta.ssid, 0, sizeof(wifi_cfg.sta.ssid));
-    memset(wifi_cfg.sta.password, 0, sizeof(wifi_cfg.sta.password));
-    memcpy(wifi_cfg.sta.ssid, cfg.ssid, (sizeof(wifi_cfg.sta.ssid) - 1 < sizeof(cfg.ssid)) ? sizeof(wifi_cfg.sta.ssid) - 1 : sizeof(cfg.ssid));
-    memcpy(wifi_cfg.sta.password, cfg.password, (sizeof(wifi_cfg.sta.password) - 1 < sizeof(cfg.password)) ? sizeof(wifi_cfg.sta.password) - 1 : sizeof(cfg.password));
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_cfg.sta.listen_interval = 3;
-
-    esp_wifi_disconnect();
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    applyWifiPowerSave(s_power_active.load());
-    if (!s_wifi_started) {
-        s_wifi_started = true;
-        esp_wifi_start();
-    } else {
-        esp_wifi_connect();
-    }
+    // Called by init/USB task, never from the event loop. The event copies cfg;
+    // all connect/config/timer policy changes are serialized on that loop.
+    ESP_ERROR_CHECK(esp_event_post(EDGE_WIFI_CONTROL, WIFI_CONTROL_CONFIG,
+                                   &cfg, sizeof(cfg), portMAX_DELAY));
 }
 
 bool wifiReady() {
@@ -359,15 +461,24 @@ static void processConfigLine(const std::string& line) {
     if (line == "BEGIN") {
         s_staging_config = configSnapshot();
         s_in_config_session = true;
+        s_wifi_config_invalid = false;
     } else if (s_in_config_session && line.rfind("CFG ", 0) == 0) {
         const size_t eq = line.find('=');
         if (eq != std::string::npos) {
             const std::string key = line.substr(4, eq - 4);
             const std::string val = line.substr(eq + 1);
             if (key == "ssid") {
+                if (val.size() > 32 || val.find('\0') != std::string::npos) {
+                    s_wifi_config_invalid = true;
+                    return;
+                }
                 strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
                 s_staging_config.ssid[sizeof(s_staging_config.ssid) - 1] = '\0';
             } else if (key == "password") {
+                if (val.size() > 64 || val.find('\0') != std::string::npos) {
+                    s_wifi_config_invalid = true;
+                    return;
+                }
                 strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
                 s_staging_config.password[sizeof(s_staging_config.password) - 1] = '\0';
             } else if (key == "camera") {
@@ -387,6 +498,17 @@ static void processConfigLine(const std::string& line) {
         }
     } else if (s_in_config_session && line == "APPLY") {
         s_in_config_session = false;
+        WifiCredentials credentials;
+        const char* wifi_error = prepareWifiCredentials(
+            std::string_view(s_staging_config.ssid, strnlen(s_staging_config.ssid, sizeof(s_staging_config.ssid))),
+            std::string_view(s_staging_config.password, strnlen(s_staging_config.password, sizeof(s_staging_config.password))),
+            credentials);
+        if (s_wifi_config_invalid || wifi_error) {
+            ESP_LOGW(TAG, "USB Wi-Fi configuration rejected: %s",
+                s_wifi_config_invalid ? "Invalid SSID/password byte length or NUL" : wifi_error);
+            usbFrame(nullptr, 0, "{\"kind\":\"config\",\"ok\":false,\"error\":\"Invalid Wi-Fi credentials or byte length\"}");
+            return; // Do not persist invalid or silently truncated credentials.
+        }
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         const bool wifi_changed = (strcmp(s_config.ssid, s_staging_config.ssid) != 0 ||
                                   strcmp(s_config.password, s_staging_config.password) != 0);
@@ -651,6 +773,39 @@ static void bleStartScan();
 static std::atomic<bool> s_ble_standby{false};
 static std::atomic<bool> s_ble_synced{false};
 static std::atomic<unsigned> s_ble_scan_duty{0};
+// Scan requests and retries share the NimBLE host queue. The timer never calls
+// GAP APIs from a second task, and queued requests use the latest desired mode.
+static ble_npl_event s_ble_scan_request;
+static ble_npl_callout s_ble_scan_retry_callout;
+static BleScanRetry s_ble_scan_retry;
+static bool s_ble_applied_standby = false; // Accessed only by the host task.
+
+static void bleRequestScan() {
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_ble_scan_request);
+}
+
+static void bleScanRequestEvent(ble_npl_event*) {
+    ble_npl_callout_stop(&s_ble_scan_retry_callout);
+    s_ble_scan_retry.clear();
+    bleStartScan();
+}
+
+static void bleScanRetryEvent(ble_npl_event*) {
+    // A stopped/replaced callout may already have an event queued.
+    if (s_ble_scan_retry.due(clockMs())) bleStartScan();
+}
+
+static void bleScheduleScanRetry(const char* operation, int rc) {
+    const uint32_t delay = s_ble_scan_retry.failed(clockMs());
+    ESP_LOGW(TAG, "BLE scan %s failed: %d; retry in %lu ms", operation, rc,
+             static_cast<unsigned long>(delay));
+    const int timer_rc = ble_npl_callout_reset(&s_ble_scan_retry_callout,
+        // One extra tick prevents an expiry just before the millisecond
+        // deadline when the FreeRTOS tick is already partly elapsed.
+        ble_npl_time_ms_to_ticks32(delay) + 1);
+    // Losing the only recovery timer must not pass unnoticed.
+    ESP_ERROR_CHECK(timer_rc == 0 ? ESP_OK : ESP_FAIL);
+}
 
 float bleScanDutyPercent() { return s_ble_scan_duty.load() / 10.0f; }
 bool powerModeActive() { return s_power_active.load(); }
@@ -715,13 +870,7 @@ EdgePowerView powerSnapshot() {
 void bleSetLowPowerScan(bool standby) {
     if (s_ble_standby.exchange(standby) == standby) return;
     if (!s_ble_synced.load()) return; // Sync callback starts the selected mode.
-    const int rc = ble_gap_disc_cancel();
-    if (rc != 0 && rc != BLE_HS_EALREADY) {
-        ESP_LOGE(TAG, "BLE scan cancel failed: %d", rc);
-        return;
-    }
-    s_ble_scan_duty.store(0);
-    bleStartScan();
+    bleRequestScan();
 }
 
 void setPowerMode(bool active) {
@@ -794,15 +943,29 @@ if (strcasecmp(receivedMac, cfg.scaleMac) != 0) {
             idx += ad_len + 1;
         }
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
-        bleStartScan();
+        s_ble_scan_duty.store(0);
+        bleRequestScan();
     }
     return 0;
 }
 
 
 static void bleStartScan() {
-    if (ble_gap_disc_active()) return;
+    if (!s_ble_synced.load()) return;
     const bool standby = s_ble_standby.load();
+    if (ble_gap_disc_active()) {
+        if (s_ble_applied_standby == standby) {
+            ble_npl_callout_stop(&s_ble_scan_retry_callout);
+            s_ble_scan_retry.clear();
+            return;
+        }
+        const int rc = ble_gap_disc_cancel();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            bleScheduleScanRetry("cancel", rc);
+            return;
+        }
+    }
+    s_ble_scan_duty.store(0);
     struct ble_gap_disc_params disc_params = {};
     disc_params.filter_duplicates = 0;
     disc_params.passive = 1;
@@ -817,14 +980,28 @@ static void bleStartScan() {
 #endif
     const int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params,
                                bleGapEventHandler, nullptr);
-    if (rc == 0) s_ble_scan_duty.store(1000U * disc_params.window / disc_params.itvl);
-    else ESP_LOGE(TAG, "BLE scan start failed: %d", rc);
+    if (rc == 0) {
+        s_ble_applied_standby = standby;
+        s_ble_scan_duty.store(1000U * disc_params.window / disc_params.itvl);
+        if (s_ble_scan_retry.pending()) {
+            ESP_LOGI(TAG, "BLE scan recovered; duty=%.1f%%", bleScanDutyPercent());
+        }
+        ble_npl_callout_stop(&s_ble_scan_retry_callout);
+        s_ble_scan_retry.clear();
+    } else if (rc == BLE_HS_EINVAL || rc == BLE_HS_ENOTSUP) {
+        // Invalid parameters / unsupported feature need a configuration fix.
+        ble_npl_callout_stop(&s_ble_scan_retry_callout);
+        s_ble_scan_retry.clear();
+        ESP_LOGE(TAG, "BLE scan start failed: %d; check scan configuration", rc);
+    } else {
+        bleScheduleScanRetry("start", rc);
+    }
 }
 
 static void bleSyncCallback() {
     s_ble_synced.store(true);
     ESP_LOGI(TAG, "NimBLE host synced; starting passive scale scanner...");
-    bleStartScan();
+    bleRequestScan();
 }
 
 static void bleHostTask(void* param) {
@@ -869,6 +1046,12 @@ void edgeIoInit() {
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t w_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&w_init_cfg);
+    esp_timer_create_args_t retry_args = {};
+    retry_args.callback = wifiRetryTimer;
+    retry_args.name = "wifi_retry";
+    ESP_ERROR_CHECK(esp_timer_create(&retry_args, &s_wifi_retry_timer));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(EDGE_WIFI_CONTROL,
+        ESP_EVENT_ANY_ID, wifiEventHandler, nullptr, nullptr));
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEventHandler, nullptr, nullptr);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifiEventHandler, nullptr, nullptr);
     esp_wifi_set_mode(WIFI_MODE_STA);
@@ -876,7 +1059,10 @@ void edgeIoInit() {
     applyWifiConfig(s_config);
 
     // 5. Bluetooth LE (NimBLE)
-    nimble_port_init();
+    ESP_ERROR_CHECK(nimble_port_init());
+    ble_npl_event_init(&s_ble_scan_request, bleScanRequestEvent, nullptr);
+    ESP_ERROR_CHECK(ble_npl_callout_init(&s_ble_scan_retry_callout,
+        nimble_port_get_dflt_eventq(), bleScanRetryEvent, nullptr) == 0 ? ESP_OK : ESP_FAIL);
     ble_hs_cfg.sync_cb = bleSyncCallback;
     nimble_port_freertos_init(bleHostTask);
 

@@ -1,0 +1,102 @@
+# CÁC LỆNH CHẠY / TEST SMARTSCALE - COM11
+# Chạy trong PowerShell tại thư mục gốc dự án.
+# Chọn từng mục cần test, không dán chạy toàn bộ file một lần.
+# Đóng viewer / monitor bằng Q, Esc hoặc Ctrl+C trước khi nạp firmware
+# hoặc mở chương trình khác dùng COM11. Mỗi lần nạp sẽ đổi firmware trên UNO.
+
+# ============================================================
+# 0. CHUẨN BỊ (chỉ cần cài thư viện lần đầu)
+# ============================================================
+Set-Location "C:\Users\ASUS\OneDrive\ESP32Camera-OhStem-AI\ESP32Camera-OhStem-AI"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r camera/requirements-usb.txt
+
+# Cài PlatformIO để test servo / BLE scanner nếu máy chưa có:
+.\.venv\Scripts\python.exe -m pip install platformio
+
+# Liệt kê cổng COM nếu cần kiểm tra:
+.\.venv\Scripts\python.exe -m serial.tools.list_ports
+
+# Các lệnh build.ps1 bên dưới cần máy đã cài ESP-IDF.
+
+# ============================================================
+# 1. TEST SCALE ONLY: CÂN + LCD + NGUỒN, KHÔNG CAMERA
+# ============================================================
+# Build và nạp:
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -StandbyScanPercent 10 -Flash -Port COM11
+
+# Xem trạng thái cân / nguồn trong 30 giây:
+.\.venv\Scripts\python.exe camera/power_monitor.py --port COM11 --seconds 30
+
+# Hoặc xem liên tục, Ctrl+C để thoát (chọn một trong hai lệnh monitor):
+.\.venv\Scripts\python.exe camera/power_monitor.py --port COM11
+
+# Thử: bước lên cân, chờ LOCK, kiểm tra LCD; bước xuống và theo dõi về nghỉ.
+# Nếu muốn so sánh quét BLE Standby 100%, nạp lại bằng lệnh sau:
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -StandbyScanPercent 100 -Flash -Port COM11
+
+# ============================================================
+# 2. TEST CAMERA + AI + CÂN CHẠY LIÊN TỤC
+# ============================================================
+# Camera chọn "6. Stream video"; camera và UNO cùng Wi-Fi 2.4 GHz.
+# Đóng các tab trình duyệt đang xem camera để tránh tranh luồng ảnh.
+# Build và nạp:
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -CameraContinuous -Flash -Port COM11
+
+# Lần đầu / khi đổi Wi-Fi, IP hoặc thông số hiệu chuẩn:
+# Nhập SSID, mật khẩu, IP camera thật và thông số theo hướng dẫn terminal.
+# Sau khi lưu, viewer tự mở để xem ảnh.
+.\.venv\Scripts\python.exe camera/usb_viewer.py --port COM11 --configure
+
+# Những lần sau chỉ mở viewer (không chạy đồng thời với lệnh configure):
+.\.venv\Scripts\python.exe camera/usb_viewer.py --port COM11
+
+# Thử: xem ảnh và khung người; đứng toàn thân trong ảnh, kiểm tra chiều cao,
+# cân LOCK và BMI trên LCD. Nhấn Q hoặc Esc để đóng viewer.
+
+# ============================================================
+# 3. TEST TÍCH HỢP: CÂN ĐÁNH THỨC CAMERA, BƯỚC XUỐNG THÌ VỀ NGHỈ
+# ============================================================
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -StandbyScanPercent 10 -Flash -Port COM11
+.\.venv\Scripts\python.exe camera/usb_viewer.py --port COM11
+
+# Nếu chưa cấu hình Wi-Fi/camera thì đóng viewer và dùng lệnh --configure ở mục 2.
+# Thử: bước lên -> ACTIVE, có ảnh/AI; bước xuống -> DRAINING rồi về nghỉ.
+# Nếu đã có kết quả BMI hợp lệ, LCD giữ kết quả 10 giây trước khi nghỉ.
+# Muốn xem nguồn thì đóng viewer trước, rồi chạy:
+.\.venv\Scripts\python.exe camera/power_monitor.py --port COM11 --seconds 30
+
+# ============================================================
+# 4. TEST SERVO MG995 RIÊNG (D11 = GPIO38)
+# ============================================================
+# Dây tín hiệu cam/vàng -> S của D11; nâu/đen -> GND; đỏ -> nguồn 5V.
+# Theo hướng dẫn firmware: ưu tiên nguồn servo 5V riêng đủ dòng, nối chung GND
+# với UNO; khi dùng nguồn riêng, không nối 5V nguồn servo vào chân 5V UNO.
+# Tháo tải cơ khí khi thử lần đầu. Bản này dành cho servo định vị.
+
+# Build và nạp firmware servo:
+.\.venv\Scripts\python.exe -m platformio run -e yolo_uno_servo_test -t upload --upload-port COM11
+
+# Xem log servo:
+.\.venv\Scripts\python.exe -m platformio device monitor --port COM11 --baud 115200
+
+# Servo tự chạy lặp giữa hai đích danh định 0 và 180 độ, chờ 1 giây mỗi đích.
+# Góc thực tế phụ thuộc servo; firmware dùng xung 1000..2000 us.
+# Ctrl+C chỉ đóng monitor, servo vẫn chạy khi bo còn nguồn.
+# Sau khi test, ngắt nguồn để dừng hoặc nạp lại mục 1 / 2 / 3 để dùng cân/camera.
+
+# ============================================================
+# 5. TEST BLE SCANNER RIÊNG (TÙY CHỌN, CHẨN ĐOÁN QUẢNG BÁ CÂN)
+# ============================================================
+# Đây là firmware scanner riêng, thay thế bản cân/camera hoặc servo trên bo.
+.\.venv\Scripts\python.exe -m platformio run -e yolo_uno_ble_scan -t upload --upload-port COM11
+.\.venv\Scripts\python.exe -m platformio device monitor --port COM11 --baud 115200
+
+# ============================================================
+# 6. UNIT TEST PYTHON (KHÔNG CẦN BO / CAMERA)
+# ============================================================
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+
+# Ghi chú: -ScaleOnly và -CameraContinuous không dùng chung trong một lệnh.
+# Muốn chỉ build, bỏ -Flash -Port COM11 khỏi lệnh build.ps1 tương ứng.
+# COM11 là cổng ví dụ; thay đồng loạt nếu máy nhận cổng khác.
