@@ -4,6 +4,24 @@
 #include "camera_packet.h"
 
 int main() {
+    // Scale-only diagnostics must work before any camera packet arrives.
+    MeasurementState scaleOnly;
+    assert(!scaleOnly.weightView(0).hasWeight);
+    scaleOnly.weight(100, 13.25f, false);
+    assert(scaleOnly.weightView(100).hasWeight);
+    assert(!scaleOnly.weightView(100).weightStable);
+    assert(!scaleOnly.view(100).hasWeight); // Existing camera gating stays intact.
+    scaleOnly.weight(200, 13.25f, true);
+    assert(scaleOnly.weightView(200).weightStable);
+    assert(std::fabs(scaleOnly.weightView(200).weightKg - 13.25f) < 0.001f);
+    assert(!scaleOnly.weightView(200).hasBMI);
+    assert(scaleOnly.weightView(30200).hasWeight);
+    assert(!scaleOnly.weightView(30201).hasWeight);
+    scaleOnly.clearWeight();
+    assert(!scaleOnly.weightView(201).hasWeight);
+    scaleOnly.weight(0xfffffff5U, 13.25f, true);
+    assert(scaleOnly.weightView(20).weightStable);
+
     MeasurementState state;
     assert(state.view(0).status == PersonStatus::None);
     state.camera(1000, PersonStatus::Measured, 180, 3);
@@ -38,6 +56,58 @@ int main() {
     state.camera(0xfffffff0U, PersonStatus::Measured, 180, 3);
     state.weight(0xfffffff5U, 81, true);
     assert(state.view(20).hasBMI);
+
+    // Optional ResultHold preserves final BMI briefly after user steps off scale.
+    MeasurementState heldState(12000);
+    heldState.camera(1000, PersonStatus::Measured, 175, 2.5f);
+    heldState.weight(1100, 70, true);
+    assert(heldState.view(1100).hasBMI && !heldState.view(1100).held);
+
+    // Stepping off the scale (clearWeight) keeps the held BMI visible.
+    heldState.clearWeight();
+    auto held = heldState.view(2000);
+    assert(held.held && held.hasBMI && held.hasHeight && held.hasWeight && held.weightStable);
+    assert(std::fabs(held.weightKg - 70.0f) < 0.001f);
+    assert(std::fabs(held.heightCm - 175.0f) < 0.001f);
+
+    // Walking out of the camera frame still preserves held BMI until holdMs expires.
+    heldState.camera(2500, PersonStatus::None);
+    held = heldState.view(12000);
+    assert(held.held && held.hasBMI);
+    assert(!heldState.view(13101).hasBMI && !heldState.view(13101).held);
+
+    // A new person stepping onto the scale clears the previous hold immediately.
+    heldState.camera(20000, PersonStatus::Measured, 175, 2.5f);
+    heldState.weight(20100, 70, true);
+    heldState.clearWeight();
+    assert(heldState.view(20200).held);
+    heldState.weight(20300, 58.5f, false);
+    const auto nextPerson = heldState.view(20300);
+    assert(!nextPerson.held && !nextPerson.hasBMI && nextPerson.hasWeight);
+    assert(std::fabs(nextPerson.weightKg - 58.5f) < 0.001f);
+
+    // Multiple people and explicit clearHold() cancel any held result immediately.
+    heldState.weight(20500, 58.5f, true);
+    heldState.clearWeight();
+    assert(heldState.view(20600).held);
+    heldState.camera(20700, PersonStatus::Multiple);
+    assert(heldState.view(20700).status == PersonStatus::Multiple && !heldState.view(20700).held);
+    heldState.camera(20800, PersonStatus::None);
+    assert(!heldState.view(20800).held && !heldState.view(20800).hasBMI);
+
+    heldState.camera(30000, PersonStatus::Measured, 170, 2.5f);
+    heldState.weight(30100, 65, true);
+    heldState.clearWeight();
+    assert(heldState.view(30200).held);
+    heldState.clearHold();
+    assert(!heldState.view(30200).held && !heldState.view(30200).hasBMI);
+
+    // Rollover safety for ResultHold.
+    heldState.camera(0xfffff000U, PersonStatus::Measured, 180, 3);
+    heldState.weight(0xfffff100U, 81, true);
+    heldState.clearWeight();
+    assert(heldState.view(0x00000100U).held && heldState.view(0x00000100U).hasBMI);
+    assert(!heldState.view(0x00004000U).held && !heldState.view(0x00004000U).hasBMI);
 
     PersonStatus status;
     float height, distance;

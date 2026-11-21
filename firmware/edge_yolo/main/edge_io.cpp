@@ -1,9 +1,15 @@
 #include "edge_io.h"
+#include "ble_scan_retry.h"
+#include "wifi_reconnect.h"
+#include "wifi_credentials.h"
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <algorithm>
-#include <cmath>
+#include <string_view>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,9 +17,14 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
+#include "esp_private/esp_clk.h"
+#include "esp_rom_crc.h"
+#include "esp_rom_sys.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "driver/usb_serial_jtag.h"
@@ -44,11 +55,60 @@ uint32_t clockMs() {
 // 2. Global State & Measurement Machine
 // =========================================================================
 static MeasurementState s_measurements;
+static ScalePresence s_scale_presence;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static std::atomic<bool> s_power_active{true};
+static esp_pm_lock_handle_t s_active_cpu_lock = nullptr;
+static esp_pm_lock_handle_t s_active_sleep_lock = nullptr;
+static esp_pm_lock_handle_t s_usb_sleep_lock = nullptr;
+static std::atomic<bool> s_usb_sleep_blocked{true};
+static void initPowerManagement();
+static void powerMonitorTask(void* arg);
+
+MeasurementView scaleSnapshot() {
+    return scaleSampleSnapshot().measurement;
+}
+
+ScaleSample scaleSampleSnapshot() {
+    portENTER_CRITICAL(&s_state_mux);
+    const auto view = s_scale_presence.snapshot(clockMs());
+    portEXIT_CRITICAL(&s_state_mux);
+    return view;
+}
+
+static void updateCameraLocked(PersonStatus status, float height, float distance) {
+    const uint32_t now = clockMs();
+    s_measurements.camera(now, status, height, distance);
+    const auto scale = s_scale_presence.snapshot(now);
+    if (status != PersonStatus::None && status != PersonStatus::Multiple && scale.present()) {
+        s_measurements.weight(now, scale.measurement.weightKg, scale.measurement.weightStable);
+    } else {
+        s_measurements.clearWeight();
+    }
+}
 
 void cameraState(PersonStatus status, float height, float distance) {
     portENTER_CRITICAL(&s_state_mux);
-    s_measurements.camera(clockMs(), status, height, distance);
+    updateCameraLocked(status, height, distance);
+    portEXIT_CRITICAL(&s_state_mux);
+}
+
+bool cameraStateForScaleSession(uint32_t session, PersonStatus status, float height,
+                                float distance, MeasurementView& out) {
+    portENTER_CRITICAL(&s_state_mux);
+    const auto scale = s_scale_presence.snapshot(clockMs());
+    const bool valid = scale.present() && scale.sessionId == session;
+    if (valid) {
+        updateCameraLocked(status, height, distance);
+        out = s_measurements.view(clockMs());
+    }
+    portEXIT_CRITICAL(&s_state_mux);
+    return valid;
+}
+
+void clearMeasurementHold() {
+    portENTER_CRITICAL(&s_state_mux);
+    s_measurements.clearHold();
     portEXIT_CRITICAL(&s_state_mux);
 }
 
@@ -60,13 +120,77 @@ MeasurementView stateSnapshot() {
 }
 
 // =========================================================================
-// 3. Configuration & NVS Management
+// 3. Configuration, MAC Filter & NVS Management
 // =========================================================================
 static EdgeConfig s_config;
 static SemaphoreHandle_t s_config_mutex = nullptr;
 static SemaphoreHandle_t s_usb_tx_mutex = nullptr;
 static bool s_in_config_session = false;
+static bool s_staging_valid = true;
+static bool s_wifi_config_invalid = false;
 static EdgeConfig s_staging_config;
+
+static uint8_t s_scale_mac_le[6] = {};
+static bool s_scale_mac_enabled = false;
+static portMUX_TYPE s_ble_mac_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static int hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static bool parseMacLe(const char* text, uint8_t outLe[6]) {
+    if (!text || strlen(text) != 17) return false;
+    for (int i = 0; i < 6; ++i) {
+        const char* p = text + i * 3;
+        const int hi = hexNibble(p[0]);
+        const int lo = hexNibble(p[1]);
+        if (hi < 0 || lo < 0) return false;
+        if (i < 5 && p[2] != ':') return false;
+        outLe[5 - i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void normalizeMacLower(char* mac) {
+    if (!mac) return;
+    for (size_t i = 0; mac[i]; ++i) {
+        mac[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(mac[i])));
+    }
+}
+
+static void updateScaleMacFilter(const char* macStr) {
+    uint8_t parsed[6] = {};
+    bool enable = false;
+    if (macStr && macStr[0] != '\0' && strcmp(macStr, "00:00:00:00:00:00") != 0) {
+        if (parseMacLe(macStr, parsed)) {
+            enable = true;
+        } else {
+            ESP_LOGW(TAG, "Ignoring invalid scale MAC filter '%s'", macStr);
+        }
+    }
+    portENTER_CRITICAL(&s_ble_mac_mux);
+    s_scale_mac_enabled = enable;
+    if (enable) memcpy(s_scale_mac_le, parsed, sizeof(s_scale_mac_le));
+    portEXIT_CRITICAL(&s_ble_mac_mux);
+}
+
+static bool parseFloatStrict(const std::string& val, float minVal, float maxVal, float& out, bool allowZero = false) {
+    if (val.empty()) return false;
+    for (unsigned char c : val) {
+        if (std::isspace(c)) return false;
+    }
+    char* end = nullptr;
+    const float v = strtof(val.c_str(), &end);
+    if (end == val.c_str() || *end != '\0' || !std::isfinite(v)) return false;
+    if ((v >= minVal && v <= maxVal) || (allowZero && v == 0.0f)) {
+        out = v;
+        return true;
+    }
+    return false;
+}
 
 static void normalizeCameraUrl(char* url, size_t cap) {
     if (!url || !url[0]) return;
@@ -87,37 +211,64 @@ static void normalizeCameraUrl(char* url, size_t cap) {
     }
 }
 
+static void sanitizeConfig(EdgeConfig& cfg) {
+    if (!std::isfinite(cfg.distanceM) || cfg.distanceM < 0.1f || cfg.distanceM > 20.0f) {
+        cfg.distanceM = 3.0f;
+    }
+    if (!std::isfinite(cfg.referenceCm) || cfg.referenceCm < 30.0f || cfg.referenceCm > 250.0f) {
+        cfg.referenceCm = 183.0f;
+    }
+    if (!std::isfinite(cfg.focalPx) || (cfg.focalPx != 0.0f && (cfg.focalPx < 0.01f || cfg.focalPx > 20.0f))) {
+        cfg.focalPx = 0.0f;
+    }
+    if (!std::isfinite(cfg.cameraHeightCm) || cfg.cameraHeightCm < 0.0f || cfg.cameraHeightCm > 400.0f) {
+        cfg.cameraHeightCm = 0.0f;
+    }
+    if (!std::isfinite(cfg.tiltDeg) || cfg.tiltDeg < -79.0f || cfg.tiltDeg > 79.0f) {
+        cfg.tiltDeg = 0.0f;
+    }
+    normalizeMacLower(cfg.scaleMac);
+    uint8_t dummy[6];
+    if (cfg.scaleMac[0] != '\0' && !parseMacLe(cfg.scaleMac, dummy)) {
+        cfg.scaleMac[0] = '\0';
+    }
+}
+
 static void loadConfigFromNvs(EdgeConfig& cfg) {
     nvs_handle_t h;
-    if (nvs_open("edge_cfg", NVS_READONLY, &h) != ESP_OK) return;
+    if (nvs_open("edge_cfg", NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = sizeof(cfg.ssid);
+        nvs_get_str(h, "ssid", cfg.ssid, &sz);
+        sz = sizeof(cfg.password);
+        nvs_get_str(h, "pass", cfg.password, &sz);
+        sz = sizeof(cfg.cameraUrl);
+        nvs_get_str(h, "camera", cfg.cameraUrl, &sz);
+        normalizeCameraUrl(cfg.cameraUrl, sizeof(cfg.cameraUrl));
+        sz = sizeof(cfg.scaleMac);
+        nvs_get_str(h, "mac", cfg.scaleMac, &sz);
 
-    size_t sz = sizeof(cfg.ssid);
-    nvs_get_str(h, "ssid", cfg.ssid, &sz);
-    sz = sizeof(cfg.password);
-    nvs_get_str(h, "pass", cfg.password, &sz);
-    sz = sizeof(cfg.cameraUrl);
-    nvs_get_str(h, "camera", cfg.cameraUrl, &sz);
-    normalizeCameraUrl(cfg.cameraUrl, sizeof(cfg.cameraUrl));
-    sz = sizeof(cfg.scaleMac);
-    nvs_get_str(h, "mac", cfg.scaleMac, &sz);
+        uint8_t gm = 0;
+        if (nvs_get_u8(h, "gmode", &gm) == ESP_OK) cfg.groundMode = (gm != 0);
 
-    uint8_t gm = 0;
-    if (nvs_get_u8(h, "gmode", &gm) == ESP_OK) cfg.groundMode = (gm != 0);
+        sz = sizeof(float);
+        nvs_get_blob(h, "dist", &cfg.distanceM, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "ref_cm", &cfg.referenceCm, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "focal", &cfg.focalPx, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "cam_h", &cfg.cameraHeightCm, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "tilt", &cfg.tiltDeg, &sz);
 
-    sz = sizeof(float);
-    nvs_get_blob(h, "dist", &cfg.distanceM, &sz);
-    sz = sizeof(float);
-    nvs_get_blob(h, "ref_cm", &cfg.referenceCm, &sz);
-    sz = sizeof(float);
-    nvs_get_blob(h, "focal", &cfg.focalPx, &sz);
-    sz = sizeof(float);
-    nvs_get_blob(h, "cam_h", &cfg.cameraHeightCm, &sz);
-    sz = sizeof(float);
-    nvs_get_blob(h, "tilt", &cfg.tiltDeg, &sz);
+        nvs_close(h);
+    }
 
-    nvs_close(h);
-    ESP_LOGI(TAG, "Configuration loaded from NVS: camera=%s mode=%s",
-             cfg.cameraUrl, cfg.groundMode ? "ground" : "fixed");
+    sanitizeConfig(cfg);
+    updateScaleMacFilter(cfg.scaleMac);
+    ESP_LOGI(TAG, "Configuration loaded: camera=%s mode=%s mac=%s",
+             cfg.cameraUrl, cfg.groundMode ? "ground" : "fixed",
+             cfg.scaleMac[0] ? cfg.scaleMac : "(any)");
 }
 
 static void saveConfigToNvs(const EdgeConfig& cfg) {
@@ -149,8 +300,13 @@ EdgeConfig configSnapshot() {
 }
 
 void saveFocalIfUnchanged(const EdgeConfig& original, float focal) {
+    if (!std::isfinite(focal) || focal < 0.01f || focal > 20.0f) {
+        ESP_LOGW(TAG, "Rejected invalid auto-calibrated focalPx: %.4f", focal);
+        return;
+    }
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    if (std::fabs(s_config.focalPx - original.focalPx) < 0.0001f) {
+    if (s_config.revision == original.revision &&
+        std::fabs(s_config.focalPx - original.focalPx) < 0.0001f) {
         s_config.focalPx = focal;
         nvs_handle_t h;
         if (nvs_open("edge_cfg", NVS_READWRITE, &h) == ESP_OK) {
@@ -164,26 +320,147 @@ void saveFocalIfUnchanged(const EdgeConfig& original, float focal) {
 }
 
 // =========================================================================
-// 4. Wi-Fi Station
+// 4. Wi-Fi Station (Serialized on Default Event Loop)
 // =========================================================================
-static bool s_wifi_ready = false;
-static bool s_wifi_started = false;
+static std::atomic<bool> s_wifi_ready{false};
+static std::atomic<bool> s_wifi_started{false};
 static char s_wifi_ip[16] = "no IP";
 static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
+ESP_EVENT_DEFINE_BASE(EDGE_WIFI_CONTROL);
+enum { WIFI_CONTROL_CONFIG, WIFI_CONTROL_RETRY };
+static esp_timer_handle_t s_wifi_retry_timer = nullptr;
+static WifiReconnect s_wifi_reconnect;
+static wifi_config_t s_wifi_desired_config = {};
+static bool s_wifi_waiting_stop = false;
+
+static void wifiClearReady() {
+    s_wifi_ready.store(false);
+    portENTER_CRITICAL(&s_ip_mux);
+    strcpy(s_wifi_ip, "no IP");
+    portEXIT_CRITICAL(&s_ip_mux);
+}
+
+static void wifiCancelRetry() {
+    s_wifi_reconnect.cancel();
+    esp_timer_stop(s_wifi_retry_timer); // An inactive timer is harmless.
+}
+
+static void wifiRetryTimer(void*) {
+    // Never connect or wait on the system timer task. A stale wakeup is checked
+    // against the current policy/deadline when the event loop receives it.
+    if (esp_event_post(EDGE_WIFI_CONTROL, WIFI_CONTROL_RETRY, nullptr, 0, 0) != ESP_OK) {
+        // Queue full: preserve recovery without blocking this timer callback.
+        // INVALID_STATE means a newer retry has already armed this timer.
+        esp_timer_start_once(s_wifi_retry_timer, 100000);
+    }
+}
+
+static void wifiArmRetry() {
+    if (!s_wifi_reconnect.pending()) return;
+    esp_timer_stop(s_wifi_retry_timer);
+    const uint32_t wait = std::max<uint32_t>(1, s_wifi_reconnect.remaining(clockMs()));
+    const esp_err_t rc = esp_timer_start_once(s_wifi_retry_timer, uint64_t(wait) * 1000);
+    // A queue-full timer callback can rearm concurrently. Its earlier wakeup
+    // is safe: the event loop checks the deadline again before connecting.
+    ESP_ERROR_CHECK(rc == ESP_ERR_INVALID_STATE ? ESP_OK : rc);
+}
+
+static void wifiScheduleRetry() {
+    s_wifi_reconnect.disconnected(clockMs());
+    wifiArmRetry();
+}
+
+static void wifiConnectNow() {
+    if (!s_wifi_reconnect.enabled() || s_wifi_waiting_stop || !s_wifi_started.load()) return;
+    wifiCancelRetry();
+    const esp_err_t rc = esp_wifi_connect();
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi connect failed: %s; retry in 2 seconds", esp_err_to_name(rc));
+        wifiScheduleRetry();
+    }
+}
+
+static void applyWifiPowerSave(bool active) {
+    // Keep the station associated; MIN_MODEM wakes at every DTIM1 beacon so the
+    // first HTTP capture after stepping on the scale starts without a beacon stall.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(active ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM));
+}
+
+static void wifiStartDesiredConfig() {
+    if (!s_wifi_reconnect.enabled()) return;
+    esp_err_t rc = esp_wifi_set_config(WIFI_IF_STA, &s_wifi_desired_config);
+    if (rc == ESP_OK) {
+        applyWifiPowerSave(s_power_active.load());
+        rc = esp_wifi_start();
+    }
+    s_wifi_started.store(rc == ESP_OK);
+    if (rc != ESP_OK) ESP_LOGE(TAG, "Wi-Fi start failed: %s", esp_err_to_name(rc));
+}
 
 static void wifiEventHandler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+    if (event_base == EDGE_WIFI_CONTROL && event_id == WIFI_CONTROL_CONFIG) {
+        const auto& cfg = *static_cast<const EdgeConfig*>(event_data);
+        WifiCredentials credentials;
+        const char* error = prepareWifiCredentials(
+            std::string_view(cfg.ssid, strnlen(cfg.ssid, sizeof(cfg.ssid))),
+            std::string_view(cfg.password, strnlen(cfg.password, sizeof(cfg.password))), credentials);
+        if (error) {
+            ESP_LOGE(TAG, "Wi-Fi configuration rejected: %s", error);
+            return; // Preserve the current connection for an invalid request.
+        }
+        wifiCancelRetry();
+        wifiClearReady();
+        s_wifi_reconnect.enable(cfg.ssid[0] != '\0');
+        if (!s_wifi_reconnect.enabled()) {
+            ESP_LOGW(TAG, "No Wi-Fi SSID configured; waiting for USB configuration");
+        }
+        s_wifi_desired_config = {};
+        static_assert(sizeof(s_wifi_desired_config.sta.ssid) == credentials.ssid.size());
+        static_assert(sizeof(s_wifi_desired_config.sta.password) == credentials.password.size());
+        memcpy(s_wifi_desired_config.sta.ssid, credentials.ssid.data(), credentials.ssid.size());
+        memcpy(s_wifi_desired_config.sta.password, credentials.password.data(), credentials.password.size());
+        s_wifi_desired_config.sta.threshold.authmode = credentials.open ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA_WPA2_PSK;
+        s_wifi_desired_config.sta.listen_interval = 3;
+        if (s_wifi_waiting_stop) return; // Keep the newest config until STOP.
+        if (s_wifi_started.load()) {
+            // STOP is an event-ordering fence: old disconnect/start events are
+            // ignored until it arrives, then only the newest config is started.
+            s_wifi_waiting_stop = true;
+            const esp_err_t rc = esp_wifi_stop();
+            if (rc != ESP_OK) {
+                s_wifi_waiting_stop = false;
+                s_wifi_reconnect.enable(false);
+                ESP_LOGE(TAG, "Wi-Fi stop for configuration failed: %s", esp_err_to_name(rc));
+            }
+        } else {
+            wifiStartDesiredConfig();
+        }
+    } else if (event_base == EDGE_WIFI_CONTROL && event_id == WIFI_CONTROL_RETRY) {
+        if (s_wifi_reconnect.due(clockMs())) wifiConnectNow();
+        else wifiArmRetry(); // An old timer event must not connect early.
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+        s_wifi_started.store(false);
+        wifiCancelRetry();
+        wifiClearReady();
+        if (s_wifi_waiting_stop) {
+            s_wifi_waiting_stop = false;
+            wifiStartDesiredConfig();
+        } else {
+            s_wifi_reconnect.enable(false);
+        }
+    } else if (s_wifi_waiting_stop || !s_wifi_reconnect.enabled()) {
+        return;
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        wifiConnectNow();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        wifiCancelRetry(); // Associated: wait for DHCP, do not start another connect.
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_ready = false;
-        portENTER_CRITICAL(&s_ip_mux);
-        strcpy(s_wifi_ip, "no IP");
-        portEXIT_CRITICAL(&s_ip_mux);
+        wifiClearReady();
         ESP_LOGW(TAG, "Wi-Fi disconnected; retrying in 2 seconds...");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_wifi_connect();
+        wifiScheduleRetry();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifiCancelRetry();
         auto* event = reinterpret_cast<ip_event_got_ip_t*>(event_data);
         ESP_LOGI(TAG, "Wi-Fi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
         char ip[16];
@@ -191,7 +468,7 @@ static void wifiEventHandler(void* arg, esp_event_base_t event_base,
         portENTER_CRITICAL(&s_ip_mux);
         strcpy(s_wifi_ip, ip);
         portEXIT_CRITICAL(&s_ip_mux);
-        s_wifi_ready = true;
+        s_wifi_ready.store(true);
     }
 }
 
@@ -203,31 +480,23 @@ void wifiIp(char* out, size_t size) {
 }
 
 static void applyWifiConfig(const EdgeConfig& cfg) {
-    if (cfg.ssid[0] == '\0') {
-        ESP_LOGW(TAG, "No Wi-Fi SSID configured; waiting for USB configuration");
-        return;
-    }
-    wifi_config_t wifi_cfg = {};
-    memset(wifi_cfg.sta.ssid, 0, sizeof(wifi_cfg.sta.ssid));
-    memset(wifi_cfg.sta.password, 0, sizeof(wifi_cfg.sta.password));
-    memcpy(wifi_cfg.sta.ssid, cfg.ssid, (sizeof(wifi_cfg.sta.ssid) - 1 < sizeof(cfg.ssid)) ? sizeof(wifi_cfg.sta.ssid) - 1 : sizeof(cfg.ssid));
-    memcpy(wifi_cfg.sta.password, cfg.password, (sizeof(wifi_cfg.sta.password) - 1 < sizeof(cfg.password)) ? sizeof(wifi_cfg.sta.password) - 1 : sizeof(cfg.password));
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    esp_wifi_disconnect();
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-    if (!s_wifi_started) {
-        s_wifi_started = true;
-        esp_wifi_start();
-        esp_wifi_set_ps(WIFI_PS_NONE);
-    } else {
-        esp_wifi_set_ps(WIFI_PS_NONE);
-        esp_wifi_connect();
-    }
+    // Called by init/USB task, never from the event loop. The event copies cfg;
+    // all connect/config/timer policy changes are serialized on that loop.
+    ESP_ERROR_CHECK(esp_event_post(EDGE_WIFI_CONTROL, WIFI_CONTROL_CONFIG,
+                                   &cfg, sizeof(cfg), portMAX_DELAY));
 }
 
 bool wifiReady() {
-    return s_wifi_ready;
+    return s_wifi_ready.load();
+}
+
+int wifiRssi() {
+    if (!wifiReady()) return 0;
+    wifi_ap_record_t ap = {};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        return ap.rssi;
+    }
+    return 0;
 }
 
 // =========================================================================
@@ -242,17 +511,6 @@ struct UsbPacketHeader {
 };
 #pragma pack(pop)
 
-static uint32_t calculateCrc32(const uint8_t* data, size_t length, uint32_t prev_crc = 0) {
-    uint32_t crc = ~prev_crc;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-        }
-    }
-    return ~crc;
-}
-
 static bool usbWriteAll(const void* data, size_t length, uint32_t timeout_ms) {
     const auto* ptr = static_cast<const uint8_t*>(data);
     const uint32_t deadline = clockMs() + timeout_ms;
@@ -266,8 +524,8 @@ static bool usbWriteAll(const void* data, size_t length, uint32_t timeout_ms) {
         // When a PC USB viewer is open, Windows drains 512 B in < 2 ms.
         // If the ringbuffer stays full for 25 ms, no viewer is reading: abort immediately
         // so the main loop never stalls when the USB viewer is closed.
-        const int n = usb_serial_jtag_write_bytes(
-            ptr + sent, chunk, pdMS_TO_TICKS(std::min<int32_t>(remain, 25)));
+        const TickType_t wait_ticks = std::max<TickType_t>(1, pdMS_TO_TICKS(std::min<int32_t>(remain, 25)));
+        const int n = usb_serial_jtag_write_bytes(ptr + sent, chunk, wait_ticks);
         if (n > 0) {
             sent += static_cast<size_t>(n);
         } else {
@@ -278,13 +536,13 @@ static bool usbWriteAll(const void* data, size_t length, uint32_t timeout_ms) {
 }
 
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
-    if (!metadata) return;
+    if (!metadata || !usb_serial_jtag_is_connected()) return;
     const uint32_t json_len = static_cast<uint32_t>(strlen(metadata));
     const uint32_t jpeg_len = (jpeg && length > 0) ? static_cast<uint32_t>(length) : 0;
 
-    uint32_t crc = calculateCrc32(reinterpret_cast<const uint8_t*>(metadata), json_len, 0);
+    uint32_t crc = esp_rom_crc32_le(0, reinterpret_cast<const uint8_t*>(metadata), json_len);
     if (jpeg_len > 0) {
-        crc = calculateCrc32(jpeg, jpeg_len, crc);
+        crc = esp_rom_crc32_le(crc, jpeg, jpeg_len);
     }
 
     UsbPacketHeader hdr;
@@ -293,53 +551,110 @@ void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     hdr.jpeg_len = jpeg_len;
     hdr.crc = crc;
 
-    if (s_usb_tx_mutex) xSemaphoreTake(s_usb_tx_mutex, portMAX_DELAY);
-    if (usbWriteAll(&hdr, sizeof(hdr), 100) && usbWriteAll(metadata, json_len, 200) && jpeg_len > 0) {
+    // Keep config replies and image/telemetry packets from interleaving.
+    if (!s_usb_tx_mutex || xSemaphoreTake(s_usb_tx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    const bool headerSent = usbWriteAll(&hdr, sizeof(hdr), 50);
+    const bool jsonSent = headerSent && usbWriteAll(metadata, json_len, 100);
+    if (jsonSent && jpeg_len > 0) {
         usbWriteAll(jpeg, jpeg_len, 1500);
     }
-    if (s_usb_tx_mutex) xSemaphoreGive(s_usb_tx_mutex);
+    xSemaphoreGive(s_usb_tx_mutex);
 }
 
 static void processConfigLine(const std::string& line) {
     if (line == "BEGIN") {
         s_staging_config = configSnapshot();
         s_in_config_session = true;
+        s_staging_valid = true;
+        s_wifi_config_invalid = false;
     } else if (s_in_config_session && line.rfind("CFG ", 0) == 0) {
         const size_t eq = line.find('=');
-        if (eq != std::string::npos) {
-            const std::string key = line.substr(4, eq - 4);
-            const std::string val = line.substr(eq + 1);
-            if (key == "ssid") {
+        if (eq == std::string::npos) {
+            s_staging_valid = false;
+            return;
+        }
+        const std::string key = line.substr(4, eq - 4);
+        const std::string val = line.substr(eq + 1);
+        if (key == "ssid") {
+            if (val.size() > 32 || val.find('\0') != std::string::npos) {
+                s_wifi_config_invalid = true;
+                s_staging_valid = false;
+            } else {
                 strncpy(s_staging_config.ssid, val.c_str(), sizeof(s_staging_config.ssid) - 1);
                 s_staging_config.ssid[sizeof(s_staging_config.ssid) - 1] = '\0';
-            } else if (key == "password") {
+            }
+        } else if (key == "password") {
+            if (val.size() > 64 || val.find('\0') != std::string::npos) {
+                s_wifi_config_invalid = true;
+                s_staging_valid = false;
+            } else {
                 strncpy(s_staging_config.password, val.c_str(), sizeof(s_staging_config.password) - 1);
                 s_staging_config.password[sizeof(s_staging_config.password) - 1] = '\0';
-            } else if (key == "camera") {
+            }
+        } else if (key == "camera") {
+            if (val.empty() || val.size() >= sizeof(s_staging_config.cameraUrl)) {
+                s_staging_valid = false;
+            } else {
                 strncpy(s_staging_config.cameraUrl, val.c_str(), sizeof(s_staging_config.cameraUrl) - 1);
                 s_staging_config.cameraUrl[sizeof(s_staging_config.cameraUrl) - 1] = '\0';
                 normalizeCameraUrl(s_staging_config.cameraUrl, sizeof(s_staging_config.cameraUrl));
-            } else if (key == "mac") {
+            }
+        } else if (key == "mac") {
+            uint8_t dummy[6];
+            if (val.empty() || val == "00:00:00:00:00:00") {
+                s_staging_config.scaleMac[0] = '\0';
+            } else if (parseMacLe(val.c_str(), dummy)) {
                 strncpy(s_staging_config.scaleMac, val.c_str(), sizeof(s_staging_config.scaleMac) - 1);
                 s_staging_config.scaleMac[sizeof(s_staging_config.scaleMac) - 1] = '\0';
+                normalizeMacLower(s_staging_config.scaleMac);
+            } else {
+                ESP_LOGW(TAG, "Rejected invalid MAC in config: '%s'", val.c_str());
+                s_staging_valid = false;
             }
-            else if (key == "mode") s_staging_config.groundMode = (val == "ground");
-            else if (key == "distance") s_staging_config.distanceM = strtof(val.c_str(), nullptr);
-            else if (key == "reference") s_staging_config.referenceCm = strtof(val.c_str(), nullptr);
-            else if (key == "focal") s_staging_config.focalPx = strtof(val.c_str(), nullptr);
-            else if (key == "height") s_staging_config.cameraHeightCm = strtof(val.c_str(), nullptr);
-            else if (key == "tilt") s_staging_config.tiltDeg = strtof(val.c_str(), nullptr);
+        } else if (key == "mode") {
+            if (val == "ground") s_staging_config.groundMode = true;
+            else if (val == "fixed") s_staging_config.groundMode = false;
+            else s_staging_valid = false;
+        } else if (key == "distance") {
+            if (!parseFloatStrict(val, 0.1f, 20.0f, s_staging_config.distanceM)) s_staging_valid = false;
+        } else if (key == "reference") {
+            if (!parseFloatStrict(val, 30.0f, 250.0f, s_staging_config.referenceCm)) s_staging_valid = false;
+        } else if (key == "focal") {
+            if (!parseFloatStrict(val, 0.01f, 20.0f, s_staging_config.focalPx, true)) s_staging_valid = false;
+        } else if (key == "height") {
+            if (!parseFloatStrict(val, 0.0f, 400.0f, s_staging_config.cameraHeightCm, true)) s_staging_valid = false;
+        } else if (key == "tilt") {
+            if (!parseFloatStrict(val, -79.0f, 79.0f, s_staging_config.tiltDeg)) s_staging_valid = false;
+        } else {
+            ESP_LOGW(TAG, "Unknown configuration key '%s'", key.c_str());
+            s_staging_valid = false;
         }
     } else if (s_in_config_session && line == "APPLY") {
         s_in_config_session = false;
+        WifiCredentials credentials;
+        const char* wifi_error = prepareWifiCredentials(
+            std::string_view(s_staging_config.ssid, strnlen(s_staging_config.ssid, sizeof(s_staging_config.ssid))),
+            std::string_view(s_staging_config.password, strnlen(s_staging_config.password, sizeof(s_staging_config.password))),
+            credentials);
+        if (!s_staging_valid || s_wifi_config_invalid || wifi_error) {
+            ESP_LOGW(TAG, "Rejected invalid configuration session (%s)",
+                     wifi_error ? wifi_error : "invalid parameter");
+            usbFrame(nullptr, 0, "{\"kind\":\"config\",\"ok\":false}");
+            return;
+        }
+
         xSemaphoreTake(s_config_mutex, portMAX_DELAY);
         const bool wifi_changed = (strcmp(s_config.ssid, s_staging_config.ssid) != 0 ||
                                   strcmp(s_config.password, s_staging_config.password) != 0);
+        const bool needs_wifi_start = (!s_wifi_started.load() && s_staging_config.ssid[0] != '\0');
+        s_staging_config.revision = s_config.revision + 1;
         s_config = s_staging_config;
         saveConfigToNvs(s_config);
+        updateScaleMacFilter(s_config.scaleMac);
         xSemaphoreGive(s_config_mutex);
 
-        if (wifi_changed) {
+        clearMeasurementHold();
+        if (wifi_changed || needs_wifi_start) {
             applyWifiConfig(s_staging_config);
         }
         usbFrame(nullptr, 0, "{\"kind\":\"config\",\"ok\":true}");
@@ -349,6 +664,7 @@ static void processConfigLine(const std::string& line) {
 static void usbReceiverTask(void* pvParameters) {
     uint8_t buf[256];
     std::string line_accum;
+    line_accum.reserve(260);
     while (true) {
         const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(50));
         for (int i = 0; i < n; ++i) {
@@ -370,9 +686,15 @@ static void usbReceiverTask(void* pvParameters) {
 // =========================================================================
 static uint8_t s_lcd_addr = 0x21; // Default lab address
 static bool s_lcd_ready = false;
+static bool s_lcd_backlight = true; // Protected by s_lcd_mutex after init.
+static bool s_lcd_holding = false;
+static MeasurementView s_lcd_result;
 static char s_lcd_msg_first[17] = {};
 static char s_lcd_msg_second[17] = {};
+static char s_lcd_prev[2][17] = {};
+static bool s_lcd_prev_valid[2] = {false, false};
 static uint32_t s_lcd_override_until = 0;
+static bool s_lcd_override_active = false;
 static SemaphoreHandle_t s_lcd_mutex = nullptr;
 
 #if defined(USE_I2C_MASTER_NEW)
@@ -398,68 +720,122 @@ static bool i2cTransmit(const uint8_t* data, size_t len) {
 static bool i2cTransmit(const uint8_t* data, size_t len) { return false; }
 #endif
 
+static void pcfExpanderWrite(uint8_t val) {
+    const uint8_t byte = static_cast<uint8_t>(val | (s_lcd_backlight ? 0x08 : 0x00));
+    i2cTransmit(&byte, 1);
+}
+
 static void pcfWriteNibble(uint8_t nibble, bool is_data) {
-    const uint8_t b = (nibble & 0xF0) | (is_data ? 0x01 : 0x00) | 0x08; // 0x08 = Backlight
-    uint8_t seq[2] = {
-        static_cast<uint8_t>(b | 0x04),  // Enable HIGH
-        static_cast<uint8_t>(b & ~0x04)  // Enable LOW
-    };
-    i2cTransmit(seq, sizeof(seq));
+    const uint8_t b = (nibble & 0xF0) | (is_data ? 0x01 : 0x00);
+    pcfExpanderWrite(b);                               // Setup RS/RW + Data before E rising edge
+    esp_rom_delay_us(2);
+    pcfExpanderWrite(static_cast<uint8_t>(b | 0x04));  // Enable HIGH
+    esp_rom_delay_us(2);                               // Enable pulse width > 450 ns
+    pcfExpanderWrite(static_cast<uint8_t>(b & ~0x04)); // Enable LOW (latch)
+    esp_rom_delay_us(60);                              // HD44780 command/data settle > 37 us
 }
 
 static void lcdWriteByte(uint8_t val, bool is_data) {
     pcfWriteNibble(val & 0xF0, is_data);
     pcfWriteNibble((val << 4) & 0xF0, is_data);
-}
-
-static void lcdSetLine(uint8_t row, const std::string& text) {
-    lcdWriteByte(row == 0 ? 0x80 : 0xC0, false);
-    for (size_t i = 0; i < 16; ++i) {
-        const char ch = (i < text.size()) ? text[i] : ' ';
-        lcdWriteByte(static_cast<uint8_t>(ch), true);
+    if (!is_data && val <= 0x03) {
+        esp_rom_delay_us(2000); // Clear Display / Return Home require > 1.52 ms
+    } else {
+        esp_rom_delay_us(60);
     }
 }
 
-static void initLcdHardware() {
-#if defined(USE_I2C_MASTER_NEW)
-    i2c_master_bus_config_t bus_cfg = {};
-    bus_cfg.i2c_port = I2C_NUM_0;
-    bus_cfg.sda_io_num = static_cast<gpio_num_t>(11);
-    bus_cfg.scl_io_num = static_cast<gpio_num_t>(12);
-    bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-    bus_cfg.glitch_ignore_cnt = 7;
-    if (i2c_new_master_bus(&bus_cfg, &s_i2c_bus) != ESP_OK) return;
+// Re-synchronizes the HD44780 4-bit nibble boundary without clearing DDRAM, so
+// any single dropped nibble from wire noise or power transient self-heals
+// back to byte alignment without flickering the screen.
+static void lcdResync4Bit() {
+    pcfExpanderWrite(0x00);
+    esp_rom_delay_us(1000);
+    pcfWriteNibble(0x30, false);
+    esp_rom_delay_us(4500);
+    pcfWriteNibble(0x30, false);
+    esp_rom_delay_us(4500);
+    pcfWriteNibble(0x30, false);
+    esp_rom_delay_us(200);
+    pcfWriteNibble(0x20, false); // Enter 4-bit mode, aligned on high nibble
+    esp_rom_delay_us(200);
 
-    // Scan for PCF8574 backpacks (0x20..0x27, 0x38..0x3F)
-    const uint8_t candidates[] = {0x21, 0x27, 0x20, 0x3F, 0x38};
+    lcdWriteByte(0x28, false); // 2 lines, 5x8 font
+    lcdWriteByte(0x0C, false); // Display ON, Cursor OFF, Blink OFF
+    lcdWriteByte(0x06, false); // Entry mode increment, no shift
+}
+
+static void lcdSetLine(uint8_t row, const char* text) {
+    if (row > 1) return;
+    char padded[17];
+    const size_t len = text ? strlen(text) : 0;
+    for (size_t i = 0; i < 16; ++i) {
+        padded[i] = (i < len) ? text[i] : ' ';
+    }
+    padded[16] = '\0';
+    if (s_lcd_prev_valid[row] && memcmp(s_lcd_prev[row], padded, 16) == 0) {
+        return;
+    }
+    lcdWriteByte(row == 0 ? 0x80 : 0xC0, false);
+    for (size_t i = 0; i < 16; ++i) {
+        lcdWriteByte(static_cast<uint8_t>(padded[i]), true);
+    }
+    memcpy(s_lcd_prev[row], padded, sizeof(padded));
+    s_lcd_prev_valid[row] = true;
+}
+
+static void initLcdHardware() {
+    if (s_lcd_ready) return;
+
+#if defined(USE_I2C_MASTER_NEW)
+    if (!s_i2c_bus) {
+        i2c_master_bus_config_t bus_cfg = {};
+        bus_cfg.i2c_port = I2C_NUM_0;
+        bus_cfg.sda_io_num = static_cast<gpio_num_t>(11);
+        bus_cfg.scl_io_num = static_cast<gpio_num_t>(12);
+        bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+        bus_cfg.glitch_ignore_cnt = 7;
+        bus_cfg.flags.enable_internal_pullup = true;
+        if (i2c_new_master_bus(&bus_cfg, &s_i2c_bus) != ESP_OK) return;
+    }
+
+    // Scan PCF8574 (0x20..0x27) & PCF8574A (0x38..0x3F), checking common lab addresses first.
+    static constexpr uint8_t candidates[] = {
+        0x21, 0x27, 0x3F, 0x20, 0x22, 0x23, 0x24, 0x25, 0x26,
+        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E
+    };
     for (uint8_t addr : candidates) {
-        i2c_device_config_t dev_cfg = {};
-        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
-        dev_cfg.device_address = addr;
-        dev_cfg.scl_speed_hz = 100000;
-        if (i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev) == ESP_OK) {
-            uint8_t probe = 0x08;
-            if (i2c_master_transmit(s_i2c_dev, &probe, 1, 30) == ESP_OK) {
+        if (i2c_master_probe(s_i2c_bus, addr, 30) == ESP_OK) {
+            i2c_device_config_t dev_cfg = {};
+            dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+            dev_cfg.device_address = addr;
+            dev_cfg.scl_speed_hz = 50000;
+            if (i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_i2c_dev) == ESP_OK) {
                 s_lcd_addr = addr;
                 s_lcd_ready = true;
                 ESP_LOGI(TAG, "LCD detected at I2C address 0x%02X", s_lcd_addr);
                 break;
             }
-            i2c_master_bus_rm_device(s_i2c_dev);
-            s_i2c_dev = nullptr;
         }
     }
 #elif defined(USE_I2C_MASTER_LEGACY)
-    i2c_config_t conf = {};
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = 11;
-    conf.scl_io_num = 12;
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = 100000;
-    i2c_param_config(I2C_NUM_0, &conf);
-    i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
-    s_lcd_ready = true;
+    static bool s_legacy_bus_installed = false;
+    if (!s_legacy_bus_installed) {
+        i2c_config_t conf = {};
+        conf.mode = I2C_MODE_MASTER;
+        conf.sda_io_num = 11;
+        conf.scl_io_num = 12;
+        conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
+        conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
+        conf.master.clk_speed = 50000;
+        i2c_param_config(I2C_NUM_0, &conf);
+        if (i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0) == ESP_OK) {
+            s_legacy_bus_installed = true;
+        }
+    }
+    if (s_legacy_bus_installed) {
+        s_lcd_ready = true;
+    }
 #endif
 
     if (!s_lcd_ready) {
@@ -467,27 +843,24 @@ static void initLcdHardware() {
         return;
     }
 
-    // HD44780 4-bit initialization sequence
-    vTaskDelay(pdMS_TO_TICKS(50));
-    pcfWriteNibble(0x30, false);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    pcfWriteNibble(0x30, false);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    pcfWriteNibble(0x30, false);
-    pcfWriteNibble(0x20, false); // 4-bit mode
+    s_lcd_prev_valid[0] = false;
+    s_lcd_prev_valid[1] = false;
 
-    lcdWriteByte(0x28, false); // 2 lines, 5x8 font
-    lcdWriteByte(0x0C, false); // Display ON, Cursor OFF
-    lcdWriteByte(0x06, false); // Entry mode increment
+    // HD44780 4-bit initialization sequence with exact microsecond timings.
+    vTaskDelay(pdMS_TO_TICKS(50));
+    lcdResync4Bit();
     lcdWriteByte(0x01, false); // Clear display
-    vTaskDelay(pdMS_TO_TICKS(5));
+    esp_rom_delay_us(2000);
 }
 
 void lcdMessage(const char* first, const char* second) {
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
     strncpy(s_lcd_msg_first, first ? first : "", sizeof(s_lcd_msg_first) - 1);
+    s_lcd_msg_first[sizeof(s_lcd_msg_first) - 1] = '\0';
     strncpy(s_lcd_msg_second, second ? second : "", sizeof(s_lcd_msg_second) - 1);
+    s_lcd_msg_second[sizeof(s_lcd_msg_second) - 1] = '\0';
     s_lcd_override_until = clockMs() + 2000;
+    s_lcd_override_active = true;
     if (s_lcd_ready) {
         lcdSetLine(0, s_lcd_msg_first);
         lcdSetLine(1, s_lcd_msg_second);
@@ -495,32 +868,112 @@ void lcdMessage(const char* first, const char* second) {
     xSemaphoreGive(s_lcd_mutex);
 }
 
+void lcdSetBacklight(bool on) {
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    s_lcd_backlight = on;
+    if (s_lcd_ready) {
+        // E=0: changing only the backlight does not latch an LCD command.
+        const uint8_t value = on ? 0x08 : 0x00;
+        i2cTransmit(&value, 1);
+    }
+    xSemaphoreGive(s_lcd_mutex);
+}
+
+void lcdHoldResult(const MeasurementView* result) {
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    s_lcd_holding = result && result->hasBMI;
+    if (s_lcd_holding) s_lcd_result = *result;
+    s_lcd_override_until = 0;
+    s_lcd_override_active = false;
+    xSemaphoreGive(s_lcd_mutex);
+}
+
 static void lcdTask(void* pvParameters) {
+    uint32_t last_lcd_probe = clockMs();
+    uint32_t resync_counter = 0;
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(250));
-        if (!s_lcd_ready) continue;
+        const uint32_t now = clockMs();
 
-        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-        if (clockMs() < s_lcd_override_until) {
-            xSemaphoreGive(s_lcd_mutex);
+        if (!s_lcd_ready) {
+            if (now - last_lcd_probe >= 5000) {
+                last_lcd_probe = now;
+                xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+                initLcdHardware();
+                if (s_lcd_ready && s_lcd_override_active &&
+                    static_cast<int32_t>(s_lcd_override_until - clockMs()) > 0) {
+                    lcdSetLine(0, s_lcd_msg_first);
+                    lcdSetLine(1, s_lcd_msg_second);
+                }
+                xSemaphoreGive(s_lcd_mutex);
+            }
             continue;
         }
 
-        const auto view = stateSnapshot();
-        const uint32_t phase = (clockMs() / 2500) % 2;
+        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+        if (!s_lcd_backlight) {
+            xSemaphoreGive(s_lcd_mutex);
+            continue; // Avoid continuous I2C writes while asleep.
+        }
+        // Every 3 seconds (12 * 250 ms), re-assert 4-bit nibble alignment and
+        // force-refresh both lines so any I2C wire glitch self-heals cleanly.
+        if (++resync_counter >= 12) {
+            resync_counter = 0;
+            lcdResync4Bit();
+            s_lcd_prev_valid[0] = false;
+            s_lcd_prev_valid[1] = false;
+        }
+#ifdef EDGE_SCALE_ONLY
+        const auto weight = scaleSnapshot();
+        if (weight.hasWeight) {
+            char line[20];
+            snprintf(line, sizeof(line), "W:%.2f kg", weight.weightKg);
+            lcdSetLine(0, line);
+            lcdSetLine(1, weight.weightStable ? "Stable: LOCK" : "Measuring...");
+        } else {
+            lcdSetLine(0, "Mi Scale 2 ready");
+            lcdSetLine(1, "Step on scale");
+        }
+        xSemaphoreGive(s_lcd_mutex);
+        continue;
+#endif
+        if (s_lcd_override_active) {
+            if (static_cast<int32_t>(s_lcd_override_until - now) > 0) {
+                lcdSetLine(0, s_lcd_msg_first);
+                lcdSetLine(1, s_lcd_msg_second);
+                xSemaphoreGive(s_lcd_mutex);
+                continue;
+            }
+            s_lcd_override_active = false;
+        }
 
-        if (view.status == PersonStatus::None) {
-            lcdSetLine(0, "No people");
-            lcdSetLine(1, "detected");
+        const auto view = s_lcd_holding ? s_lcd_result : stateSnapshot();
+        const auto scale = scaleSnapshot();
+        const uint32_t phase = (now / 2500) % 2;
+
+        if (!s_lcd_holding && !powerModeActive()) {
+            if (scale.hasWeight) {
+                char l0[20];
+                snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+                lcdSetLine(0, l0);
+                lcdSetLine(1, "Step on scale");
+            } else {
+                lcdSetLine(0, "SmartScale Ready");
+                lcdSetLine(1, "Step on scale");
+            }
+        } else if (view.status == PersonStatus::None) {
+            if (scale.hasWeight) {
+                char l0[20];
+                snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+                lcdSetLine(0, l0);
+                lcdSetLine(1, "Look at camera");
+            } else {
+                lcdSetLine(0, "No people");
+                lcdSetLine(1, "detected");
+            }
         } else if (view.status == PersonStatus::Multiple) {
             lcdSetLine(0, "Multiple people");
             lcdSetLine(1, "One at a time");
-        } else if (view.status == PersonStatus::NeedsCalibration) {
-            lcdSetLine(0, "Person detected");
-            lcdSetLine(1, "Need calibration");
-        } else if (view.status == PersonStatus::Partial) {
-            lcdSetLine(0, "Person detected");
-            lcdSetLine(1, "Full body needed");
         } else if (phase == 0) {
             char l0[20], l1[20];
             if (view.hasHeight) snprintf(l0, sizeof(l0), "H:%.1fcm", view.heightCm);
@@ -533,10 +986,20 @@ static void lcdTask(void* pvParameters) {
             }
             lcdSetLine(0, l0);
             lcdSetLine(1, l1);
+        } else if (view.status == PersonStatus::NeedsCalibration) {
+            lcdSetLine(0, "Person detected");
+            lcdSetLine(1, "Need calibration");
+        } else if (view.status == PersonStatus::Partial) {
+            lcdSetLine(0, "Person detected");
+            lcdSetLine(1, "Full body needed");
         } else {
             char l0[20], l1[20];
-            if (view.hasHeight) snprintf(l0, sizeof(l0), "D:%.2fm", view.distanceM);
-            else snprintf(l0, sizeof(l0), "D:--");
+            if (view.hasHeight) {
+                if (view.held || s_lcd_holding) snprintf(l0, sizeof(l0), "D:%.2fm HOLD", view.distanceM);
+                else snprintf(l0, sizeof(l0), "D:%.2fm", view.distanceM);
+            } else {
+                snprintf(l0, sizeof(l0), "D:--");
+            }
 
             if (view.hasBMI) snprintf(l1, sizeof(l1), "BMI:%.2f", view.bmi);
             else snprintf(l1, sizeof(l1), "BMI:-- wait lock");
@@ -549,12 +1012,147 @@ static void lcdTask(void* pvParameters) {
 }
 
 // =========================================================================
-// 7. Bluetooth LE (Mi Scale 2 Advertisement Observer)
+// 7. Power Management & Bluetooth LE (Mi Scale 2 Passive 0x181D Observer)
 // =========================================================================
 static void bleStartScan();
+static std::atomic<bool> s_ble_standby{false};
+static std::atomic<bool> s_ble_synced{false};
+static std::atomic<unsigned> s_ble_scan_duty{0};
+// Scan requests and retries share the NimBLE host queue. The timer never calls
+// GAP APIs from a second task, and queued requests use the latest desired mode.
+static ble_npl_event s_ble_scan_request;
+static ble_npl_callout s_ble_scan_retry_callout;
+static BleScanRetry s_ble_scan_retry;
+static bool s_ble_applied_standby = false; // Accessed only by the host task.
+
+static void bleRequestScan() {
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_ble_scan_request);
+}
+
+static void bleScanRequestEvent(ble_npl_event*) {
+    ble_npl_callout_stop(&s_ble_scan_retry_callout);
+    s_ble_scan_retry.clear();
+    bleStartScan();
+}
+
+static void bleScanRetryEvent(ble_npl_event*) {
+    // A stopped/replaced callout may already have an event queued.
+    if (s_ble_scan_retry.due(clockMs())) bleStartScan();
+}
+
+static void bleScheduleScanRetry(const char* operation, int rc) {
+    const uint32_t delay = s_ble_scan_retry.failed(clockMs());
+    ESP_LOGW(TAG, "BLE scan %s failed: %d; retry in %lu ms", operation, rc,
+             static_cast<unsigned long>(delay));
+    const int timer_rc = ble_npl_callout_reset(&s_ble_scan_retry_callout,
+        // One extra tick prevents an expiry just before the millisecond
+        // deadline when the FreeRTOS tick is already partly elapsed.
+        ble_npl_time_ms_to_ticks32(delay) + 1);
+    ESP_ERROR_CHECK(timer_rc == 0 ? ESP_OK : ESP_FAIL);
+}
+
+float bleScanDutyPercent() { return s_ble_scan_duty.load() / 10.0f; }
+bool powerModeActive() { return s_power_active.load(); }
+
+static void configureCpuPower(bool active) {
+    esp_pm_config_t cfg = {};
+    // RTOS runnable-task locks request CPU_MAX too. Cap that maximum at 80
+    // in standby, so telemetry/task wakeups do not raise it back to 240 MHz.
+    cfg.max_freq_mhz = active ? 240 : 80;
+    cfg.min_freq_mhz = 80;
+    cfg.light_sleep_enable = true;
+    ESP_ERROR_CHECK(esp_pm_configure(&cfg));
+}
+
+static void initPowerManagement() {
+    // ACTIVE starts with both locks held. STANDBY releases only our own locks;
+    // BLE, Wi-Fi, I2C and USB remain responsible for their driver constraints.
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "edge_active_cpu", &s_active_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_active", &s_active_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_usb", &s_usb_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_sleep_lock));
+    configureCpuPower(true);
+}
+
+static void powerMonitorTask(void* arg) {
+    while (true) {
+        const bool connected = usb_serial_jtag_is_connected();
+        if (connected != s_usb_sleep_blocked.load()) {
+            if (connected) ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_sleep_lock));
+            else ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_sleep_lock));
+            s_usb_sleep_blocked.store(connected);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+EdgePowerView powerSnapshot() {
+    EdgePowerView out;
+    esp_pm_config_t cfg = {};
+    if (esp_pm_get_configuration(&cfg) == ESP_OK) {
+        out.pmEnabled = true;
+        out.lightSleepConfigured = cfg.light_sleep_enable;
+        out.minCpuMhz = cfg.min_freq_mhz;
+        out.maxCpuMhz = cfg.max_freq_mhz;
+    }
+    out.cpuMhz = esp_clk_cpu_freq() / 1000000;
+    out.usbSleepBlocked = s_usb_sleep_blocked.load();
+    out.wifiStarted = s_wifi_started.load();
+    out.noLightSleepLocks = (s_power_active.load() ? 1 : 0) +
+                            (s_usb_sleep_blocked.load() ? 1 : 0);
+    wifi_ps_type_t ps;
+    if (esp_wifi_get_ps(&ps) == ESP_OK) {
+        out.wifiPowerSave = ps == WIFI_PS_NONE ? "NONE" :
+                           ps == WIFI_PS_MAX_MODEM ? "MAX_MODEM" : "MIN_MODEM";
+    }
+    return out;
+}
+
+void bleSetLowPowerScan(bool standby) {
+    if (s_ble_standby.exchange(standby) == standby) return;
+    if (!s_ble_synced.load()) return; // Sync callback starts the selected mode.
+    bleRequestScan();
+}
+
+void setPowerMode(bool active) {
+    if (s_power_active.load() == active) return;
+    if (active) {
+        configureCpuPower(true);
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
+        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+        s_lcd_override_until = 0;
+        s_lcd_override_active = false;
+        xSemaphoreGive(s_lcd_mutex);
+    }
+    applyWifiPowerSave(active);
+    // Keep LCD backlight ON in both ACTIVE and STANDBY so the screen is always visible.
+    lcdSetBacklight(true);
+    bleSetLowPowerScan(!active);
+    s_power_active.store(active);
+    if (!active) {
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_active_sleep_lock));
+        ESP_ERROR_CHECK(esp_pm_lock_release(s_active_cpu_lock));
+        configureCpuPower(false);
+    }
+    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%.1f%%", active ? "ACTIVE" : "STANDBY",
+             bleScanDutyPercent());
+}
 
 static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
+        uint8_t targetMac[6];
+        bool filterMac = false;
+        portENTER_CRITICAL(&s_ble_mac_mux);
+        filterMac = s_scale_mac_enabled;
+        if (filterMac) memcpy(targetMac, s_scale_mac_le, sizeof(targetMac));
+        portEXIT_CRITICAL(&s_ble_mac_mux);
+        if (filterMac && memcmp(event->disc.addr.val, targetMac, sizeof(targetMac)) != 0) {
+            return 0;
+        }
+
         const uint8_t* data = event->disc.data;
         const int len = event->disc.length_data;
         int idx = 0;
@@ -574,12 +1172,14 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
                     const uint16_t raw_weight = (sd[2] << 8) | sd[1];
 
                     portENTER_CRITICAL(&s_state_mux);
+                    float kg = raw_weight / (is_lbs ? 100.0f : 200.0f);
+                    if (is_lbs) kg *= 0.45359237f;
+                    const uint32_t now = clockMs();
+                    s_scale_presence.update(now, kg, is_stable, load_removed);
                     if (load_removed || raw_weight == 0) {
                         s_measurements.clearWeight();
                     } else {
-                        float kg = raw_weight / (is_lbs ? 100.0f : 200.0f);
-                        if (is_lbs) kg *= 0.45359237f;
-                        s_measurements.weight(clockMs(), kg, is_stable);
+                        s_measurements.weight(now, kg, is_stable);
                     }
                     portEXIT_CRITICAL(&s_state_mux);
                 }
@@ -587,42 +1187,64 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
             idx += ad_len + 1;
         }
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
-        bleStartScan();
+        s_ble_scan_duty.store(0);
+        bleRequestScan();
     }
     return 0;
 }
 
-static bool s_ble_synced = false;
-static bool s_ble_paused = false;
-
 static void bleStartScan() {
-    if (!s_ble_synced || s_ble_paused || ble_gap_disc_active()) return;
+    if (!s_ble_synced.load()) return;
+    const bool standby = s_ble_standby.load();
+    if (ble_gap_disc_active()) {
+        if (s_ble_applied_standby == standby) {
+            ble_npl_callout_stop(&s_ble_scan_retry_callout);
+            s_ble_scan_retry.clear();
+            return;
+        }
+        const int rc = ble_gap_disc_cancel();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            bleScheduleScanRetry("cancel", rc);
+            return;
+        }
+    }
+    s_ble_scan_duty.store(0);
     struct ble_gap_disc_params disc_params = {};
     disc_params.filter_duplicates = 0;
     disc_params.passive = 1;
-    // 25 ms window every 200 ms (12.5% duty cycle) instead of 100% so BLE
-    // does not starve Wi-Fi TCP packets on the shared 2.4 GHz antenna.
-    disc_params.itvl = 320;
-    disc_params.window = 40;
-    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, bleGapEventHandler, nullptr);
-}
-
-void bleSetCapturePriority(bool capturing) {
-    s_ble_paused = capturing;
-    if (!s_ble_synced) return;
-    if (capturing) {
-        if (ble_gap_disc_active()) {
-            ble_gap_disc_cancel();
+    // Use a fast 100 ms interval (160 * 0.625 ms) in standby so all 3 BLE
+    // advertising channels (37, 38, 39) are swept within 300 ms for instant wakeup.
+    disc_params.itvl = 160;
+    disc_params.window = standby ? (160 * EDGE_STANDBY_SCAN_PERCENT / 100) : 160;
+#ifndef EDGE_SCALE_ONLY
+    // Keep BLE listening during HTTP instead of cancelling discovery. Retain
+    // 25 ms window every 200 ms (12.5% duty cycle) in active camera mode.
+    if (!standby) { disc_params.itvl = 320; disc_params.window = 40; }
+#endif
+    const int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params,
+                               bleGapEventHandler, nullptr);
+    if (rc == 0) {
+        s_ble_applied_standby = standby;
+        s_ble_scan_duty.store(1000U * disc_params.window / disc_params.itvl);
+        if (s_ble_scan_retry.pending()) {
+            ESP_LOGI(TAG, "BLE scan recovered; duty=%.1f%%", bleScanDutyPercent());
         }
+        ble_npl_callout_stop(&s_ble_scan_retry_callout);
+        s_ble_scan_retry.clear();
+    } else if (rc == BLE_HS_EINVAL || rc == BLE_HS_ENOTSUP) {
+        // Invalid parameters / unsupported feature need a configuration fix.
+        ble_npl_callout_stop(&s_ble_scan_retry_callout);
+        s_ble_scan_retry.clear();
+        ESP_LOGE(TAG, "BLE scan start failed: %d; check scan configuration", rc);
     } else {
-        bleStartScan();
+        bleScheduleScanRetry("start", rc);
     }
 }
 
 static void bleSyncCallback() {
+    s_ble_synced.store(true);
     ESP_LOGI(TAG, "NimBLE host synced; starting passive scale scanner...");
-    s_ble_synced = true;
-    bleStartScan();
+    bleRequestScan();
 }
 
 static void bleHostTask(void* param) {
@@ -635,8 +1257,8 @@ static void bleHostTask(void* param) {
 // =========================================================================
 void edgeIoInit() {
     s_config_mutex = xSemaphoreCreateMutex();
-    s_usb_tx_mutex = xSemaphoreCreateMutex();
     s_lcd_mutex = xSemaphoreCreateMutex();
+    initPowerManagement();
 
     // 1. NVS
     esp_err_t err = nvs_flash_init();
@@ -648,15 +1270,19 @@ void edgeIoInit() {
 
     // 2. USB Serial / JTAG
     // Default tx_buffer_size is only 256 B, which silently drops any write > 256 B.
+    s_usb_tx_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_usb_tx_mutex ? ESP_OK : ESP_ERR_NO_MEM);
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     usb_cfg.tx_buffer_size = 4096;
     usb_cfg.rx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&usb_cfg);
-    xTaskCreate(usbReceiverTask, "usb_rx", 4096, nullptr, 4, nullptr);
+    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(powerMonitorTask, "power_monitor", 3072, nullptr, 3, nullptr, 0) == pdPASS
+                    ? ESP_OK : ESP_ERR_NO_MEM);
+    xTaskCreatePinnedToCore(usbReceiverTask, "usb_rx", 6144, nullptr, 4, nullptr, 0);
 
     // 3. LCD & Display Task
     initLcdHardware();
-    xTaskCreate(lcdTask, "lcd_ui", 3072, nullptr, 3, nullptr);
+    xTaskCreatePinnedToCore(lcdTask, "lcd_ui", 6144, nullptr, 3, nullptr, 0);
 
     // 4. Wi-Fi
     esp_netif_init();
@@ -664,15 +1290,26 @@ void edgeIoInit() {
     esp_netif_create_default_wifi_sta();
     wifi_init_config_t w_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&w_init_cfg);
+    esp_timer_create_args_t retry_args = {};
+    retry_args.callback = wifiRetryTimer;
+    retry_args.name = "wifi_retry";
+    ESP_ERROR_CHECK(esp_timer_create(&retry_args, &s_wifi_retry_timer));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(EDGE_WIFI_CONTROL,
+        ESP_EVENT_ANY_ID, wifiEventHandler, nullptr, nullptr));
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifiEventHandler, nullptr, nullptr);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifiEventHandler, nullptr, nullptr);
     esp_wifi_set_mode(WIFI_MODE_STA);
+    applyWifiPowerSave(true);
     applyWifiConfig(s_config);
 
     // 5. Bluetooth LE (NimBLE)
-    nimble_port_init();
+    ESP_ERROR_CHECK(nimble_port_init());
+    ble_npl_event_init(&s_ble_scan_request, bleScanRequestEvent, nullptr);
+    ESP_ERROR_CHECK(ble_npl_callout_init(&s_ble_scan_retry_callout,
+        nimble_port_get_dflt_eventq(), bleScanRetryEvent, nullptr) == 0 ? ESP_OK : ESP_FAIL);
     ble_hs_cfg.sync_cb = bleSyncCallback;
     nimble_port_freertos_init(bleHostTask);
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
     ESP_LOGI(TAG, "edge_io subsystem initialized successfully");
 }

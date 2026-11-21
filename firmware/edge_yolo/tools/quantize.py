@@ -11,7 +11,14 @@ import sys
 import functools
 
 ROOT = Path(__file__).resolve().parents[3]
-WORKSPACE_ROOT = ROOT.parents[1]
+WORKSPACE_ROOT = ROOT.parents[1] if len(ROOT.parents) > 1 else ROOT.parent
+
+
+def _first_existing(candidates):
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def main():
@@ -29,8 +36,11 @@ def main():
         default_model = sibling_model
     parser.add_argument("--model", type=Path, default=default_model)
     args = parser.parse_args()
-    shared_source = WORKSPACE_ROOT / ".edge-deps/esp-dl/examples/tutorial/how_to_quantize_model/quantize_yolo26"
-    source = shared_source if (shared_source / "quantize_yolo26_coco.ipynb").exists() else ROOT / ".edge-deps/quantize_yolo26"
+    source = _first_existing([
+        ROOT / ".edge-deps/esp-dl/examples/tutorial/how_to_quantize_model/quantize_yolo26",
+        WORKSPACE_ROOT / ".edge-deps/esp-dl/examples/tutorial/how_to_quantize_model/quantize_yolo26",
+        ROOT / ".edge-deps/quantize_yolo26",
+    ])
     if not (source / "quantize_yolo26_coco.ipynb").exists():
         parser.error("Run prepare_sources.ps1 first")
     config_dir = ROOT / ".edge-deps/ultralytics-config"
@@ -45,8 +55,10 @@ def main():
     from ultralytics import YOLO
     torch.set_num_threads(4)
     model = YOLO(str(args.model.resolve()))
-    shared_dataset = WORKSPACE_ROOT / ".edge-deps/datasets/coco8"
-    dataset = shared_dataset if (shared_dataset / "images/train").is_dir() else ROOT / ".edge-deps/datasets/coco8"
+    dataset = _first_existing([
+        ROOT / ".edge-deps/datasets/coco8",
+        WORKSPACE_ROOT / ".edge-deps/datasets/coco8",
+    ])
     if not (dataset / "images/train").is_dir():
         parser.error("COCO8 calibration images missing (run prepare_sources.ps1)")
     dataset_yaml = ROOT / ".edge-deps/edge_coco8.yaml"

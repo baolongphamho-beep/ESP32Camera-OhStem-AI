@@ -1,14 +1,16 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 struct PersonBox { float x1, y1, x2, y2, score; };
 
 // Match ESP-DL ImagePreprocessor's integer letterbox borders exactly.
 inline PersonBox originalBox(PersonBox b, int width, int height, int input = 224) {
+    if (width <= 0 || height <= 0 || input <= 0) return {0, 0, 0, 0, b.score};
     const float scale = std::min(float(input) / width, float(input) / height);
-    const int activeW = width >= height ? input : int(scale * width);
-    const int activeH = width >= height ? int(scale * height) : input;
+    const int activeW = std::max(1, width >= height ? input : int(scale * width));
+    const int activeH = std::max(1, width >= height ? int(scale * height) : input);
     const int left = (input - activeW) / 2, top = (input - activeH) / 2;
     b.x1 = (b.x1 - left) * width / activeW;
     b.x2 = (b.x2 - left) * width / activeW;
@@ -40,3 +42,87 @@ inline bool groundHeight(const PersonBox& b, int width, int height, float focal,
     return std::isfinite(cm) && cm >= 30 && cm <= 250 &&
            std::isfinite(distance) && distance > 0 && distance <= 20;
 }
+
+class HeightMedianFilter {
+public:
+    static constexpr size_t kMaxSamples = 5;
+
+    void reset() {
+        count_ = 0;
+        next_ = 0;
+    }
+
+    void push(float cm, float dist) {
+        if (!std::isfinite(cm) || !std::isfinite(dist)) return;
+        cm_[next_] = cm;
+        dist_[next_] = dist;
+        next_ = (next_ + 1) % kMaxSamples;
+        if (count_ < kMaxSamples) ++count_;
+    }
+
+    bool median(float& outCm, float& outDist) const {
+        if (count_ == 0) return false;
+        float sortedCm[kMaxSamples];
+        float sortedDist[kMaxSamples];
+        for (size_t i = 0; i < count_; ++i) {
+            sortedCm[i] = cm_[i];
+            sortedDist[i] = dist_[i];
+        }
+        std::sort(sortedCm, sortedCm + count_);
+        std::sort(sortedDist, sortedDist + count_);
+        const size_t mid = count_ / 2;
+        if (count_ % 2 == 1) {
+            outCm = sortedCm[mid];
+            outDist = sortedDist[mid];
+        } else {
+            outCm = 0.5f * (sortedCm[mid - 1] + sortedCm[mid]);
+            outDist = 0.5f * (sortedDist[mid - 1] + sortedDist[mid]);
+        }
+        return true;
+    }
+
+    size_t count() const { return count_; }
+
+private:
+    float cm_[kMaxSamples] = {};
+    float dist_[kMaxSamples] = {};
+    size_t count_ = 0;
+    size_t next_ = 0;
+};
+
+class AutoCalibCollector {
+public:
+    static constexpr size_t kRequired = 3;
+
+    void reset() {
+        count_ = 0;
+        next_ = 0;
+    }
+
+    bool add(float boxHeightPx, float& outMedianBoxH) {
+        if (!std::isfinite(boxHeightPx) || boxHeightPx <= 0.f) return false;
+        samples_[next_] = boxHeightPx;
+        next_ = (next_ + 1) % kRequired;
+        if (count_ < kRequired) ++count_;
+        if (count_ < kRequired) return false;
+
+        float sorted[kRequired];
+        for (size_t i = 0; i < kRequired; ++i) sorted[i] = samples_[i];
+        std::sort(sorted, sorted + kRequired);
+        const float minH = sorted[0];
+        const float medH = sorted[1];
+        const float maxH = sorted[2];
+        if (medH > 0.f && (maxH - minH) <= medH * 0.05f) {
+            outMedianBoxH = medH;
+            return true;
+        }
+        return false;
+    }
+
+    size_t count() const { return count_; }
+
+private:
+    float samples_[kRequired] = {};
+    size_t count_ = 0;
+    size_t next_ = 0;
+};

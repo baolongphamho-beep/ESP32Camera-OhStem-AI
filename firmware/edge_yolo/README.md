@@ -32,14 +32,22 @@ Không chạy `camera/smartscale_camera.py` hoặc launcher cũ trong chế đ�
 
 ## Biên dịch và nạp
 
-Đã chuẩn bị model `models/yolo26n_224_s8_s3.espdl` (~3.08 MB), ESP-DL pinned revision `512ed0b0dc5f5320f3d9ca5a5aea189803f87f31`, cùng môi trường ESP-IDF 6.1 trên máy này.
+Đã chuẩn bị model `models/yolo26n_224_s8_s3.espdl` (~3.08 MB), ESP-DL pinned revision `512ed0b0dc5f5320f3d9ca5a5aea189803f87f31`, cùng môi trường ESP-IDF 5.5.x (đã kiểm tra trên `v5.5.6`) chạy song song 2 nhân (Core 0: Wi-Fi HTTP `/capture` với `Connection: close` cho web server đơn kết nối của OhStem, BLE, USB, LCD; Core 1: `app_main` chạy suy luận YOLO26n).
 
-Từ thư mục gốc project:
+Từ thư mục gốc project (3 chế độ build):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM9
+# 1. Chế độ tích hợp mặc định (bước lên cân > 5 kg mới đánh thức camera & AI; bước xuống tự về STANDBY 80 MHz):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -StandbyScanPercent 10 -Flash -Port COM13
+
+# 2. Chế độ Camera + AI + cân chạy liên tục (dùng khi test/hiệu chuẩn camera mà chưa bước lên cân):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -CameraContinuous -Flash -Port COM13
+
+# 3. Chế độ chỉ test cân BLE + LCD + Power telemetry (không chạy camera/AI):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -StandbyScanPercent 10 -Flash -Port COM13
 ```
+
+Có thể bỏ `-Flash -Port COM13` nếu chỉ muốn biên dịch kiểm tra. Để theo dõi riêng trạng thái nguồn/CPU/BLE (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM13`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
 
 Lệnh thứ hai thay chương trình trên UNO bằng firmware này, có ghi bootloader/bảng phân vùng mới. Script không tự xóa NVS. Firmware Arduino/PlatformIO vẫn nằm nguyên trong project và có thể nạp lại bằng environment cũ.
 
@@ -55,9 +63,9 @@ Các file sau biên dịch ở `build/`: `smartscale_edge_yolo.bin`, `bootloader
 .\.venv-camera\Scripts\python.exe camera/usb_viewer.py --port COM9 --configure
 ```
 
-Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập), URL ảnh thật của camera như `http://10.127.7.68/capture`, và thông số lắp đặt. Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP.
+Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập; bỏ trống nếu mạng Wi-Fi mở), URL ảnh thật của camera như `http://10.127.7.68/capture`, MAC cân Mi Scale 2 (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` nếu muốn tắt lọc MAC) và thông số lắp đặt. Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP.
 
-- **fixed**: camera đặt ngang, biết khoảng cách tới vị trí đứng. Nhập khoảng cách (m), chiều cao thật người chuẩn (cm). Nhập `fy/H = 0` để hiệu chuẩn tự động ngay box toàn thân đầu tiên. Người đầu tiên trong khung phải chính là người chuẩn, đứng thẳng và thấy cả đỉnh đầu lẫn bàn chân. Sau đó UNO lưu tiêu cự để đo người tiếp theo ở cùng vị trí.
+- **fixed**: camera đặt ngang, biết khoảng cách tới vị trí đứng. Nhập khoảng cách (m), chiều cao thật người chuẩn (cm). Nhập `fy/H = 0` để hiệu chuẩn tự động khi có **3 frame toàn thân liên tiếp ổn định** (độ lệch chiều cao box ≤ 5%). Người đầu tiên đứng yên trong khung phải chính là người chuẩn, đứng thẳng và thấy cả đỉnh đầu lẫn bàn chân. Sau đó UNO lưu tiêu cự vào NVS để đo người tiếp theo ở cùng vị trí.
 - **ground**: nhập độ cao tâm camera tính từ **mặt trên bàn cân**, góc nghiêng xuống (độ) và `fy/H` đã hiệu chuẩn. Khoảng cách được tính từ tia chiếu chân cắt mặt phẳng bàn cân. `fy/H` bắt buộc khác 0.
 - `fy/H` là tiêu cự theo pixel chia chiều cao ảnh. Ví dụ fy=600px trên ảnh cao480px thì nhập1.25. **Không nhập tiêu cự 3.6mm.** Chuẩn hóa này chỉ giữ đúng khi cùng góc nhìn và tỷ lệ ảnh; đổi crop, xoay, zoom hoặc lens thì hiệu chuẩn lại.
 - Ở `fixed`, khoảng cách là thông số đã nhập, không phải một phép đo độc lập. Từ một box đơn lẻ không thể suy ra đồng thời chiều cao và khoảng cách khi thiếu thông tin chuẩn.
@@ -73,17 +81,18 @@ Nhấn Q hoặc Esc để đóng. Laptop không tải/chạy model. Sau cấu h�
 ## LCD và trạng thái dữ liệu
 
 - Không có người: hai dòng `No people` / `detected`.
-- Một người đủ khung và có hiệu chuẩn: luân phiên `H:...cm`, `W:...kg LOCK` với `D:...m`, `BMI:...`.
-- Cân chưa chốt: W vẫn cập nhật 2 chữ số thập phân, có `...`; BMI đợi bit ổn định của cân.
-- Nhiều người: yêu cầu một người mỗi lần. Box chạm biên ảnh bị từ chối vì có thể thiếu đầu/chân.
-- Wi-Fi/camera mất kết nối: LCD báo lỗi kết nối thay vì giữ số đo trước.
-- Dữ liệu camera hết hạn sau 10 giây, cân sau30giây. BMI chỉ có khi chiều cao mới hợp lệ và cân đã chốt. USB viewer không giữ ảnh cũ khi có thông báo camera offline.
+- Một người đủ khung và có hiệu chuẩn: dùng bộ lọc trung vị 5 khung hình cho chiều cao/khoảng cách, luân phiên `H:...cm`, `W:...kg LOCK` với `D:...m`, `BMI:...`.
+- Cân chưa chốt: W vẫn cập nhật 2 chữ số thập phân, có `...`; BMI đợi bit ổn định của cân. Khi thiếu khung/chưa hiệu chuẩn (`Partial` / `NeedsCalibration`), LCD vẫn luân phiên hiển thị cân nặng `W:...`.
+- Giữ kết quả (`ResultHold`): sau khi chốt đủ H + W `LOCK` + BMI, khi người dùng bước xuống khỏi cân (`load_removed`) hoặc rời khung hình, kết quả tiếp tục được giữ thêm **12 giây** (`D:...m HOLD` / `BMI:...`) để kịp đọc màn hình LCD (tự xóa sớm nếu có người mới đứng lên cân hoặc có nhiều người).
+- Nhiều người: yêu cầu một người mỗi lần. Box chạm biên ảnh bị từ chối vì có thể thiếu đầu/chân. Rớt 1–2 khung hình YOLO thoáng qua không làm xóa cân nặng đang đo.
+- Wi-Fi/camera mất kết nối quá 3 lần thử: LCD báo lỗi kết nối thay vì giữ số đo trước.
+- Dữ liệu camera hết hạn sau 10 giây, cân sau 30 giây. BMI chỉ có khi chiều cao mới hợp lệ và cân đã chốt. USB viewer không giữ ảnh cũ khi có thông báo camera offline.
 
 Nhận diện bằng bounding box **không bảo đảm** đỉnh hộp trùng đỉnh đầu và đáy hộp trùng chân. Chiều cao là ước lượng, cần đối chiếu thước thật với nhiều người sau khi cố định camera. Input224 và lượng tử hóa có thể giảm khả năng phát hiện người ở xa.
 
 ## Tái tạo model
 
-Các script ở `tools/` thực hiện export theo tutorial Espressif, cần Python3.11, môi trường `.venv-edge`, PyTorch CPU và `requirements.txt`. Dùng `tools/prepare_sources.ps1` để lấy runtime pinned; `tools/fetch_quant_sources.py` lấy notebook/scripts lượng tử hóa. Chuẩn bị bộ COCO8 train tại `.edge-deps/datasets/coco8` và model gốc `../ESP32Camera-OhStem-AI/yolo26n.pt`, rồi:
+Các script ở `tools/` thực hiện export theo tutorial Espressif, cần Python 3.11, môi trường `.venv-edge`, PyTorch CPU và `firmware/edge_yolo/tools/requirements.txt`. Chạy `tools/prepare_sources.ps1` để tải ESP-DL runtime (pinned revision) và bộ COCO8 train về `.edge-deps/`, đảm bảo có model gốc `yolo26n.pt` ở gốc repo, rồi:
 
 ```powershell
 .\.venv-edge\Scripts\python.exe firmware/edge_yolo/tools/quantize.py --size 224

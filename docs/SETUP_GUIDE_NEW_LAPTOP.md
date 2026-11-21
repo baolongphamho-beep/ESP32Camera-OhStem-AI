@@ -256,20 +256,19 @@ Cửa sổ **SmartScale - YOLO UNO USB viewer** sẽ hiển thị trực tiếp 
 Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toàn cáp kết nối với laptop**:
 
 1. Cấp nguồn 5V cho bo YOLO UNO bằng củ sạc hoặc pin dự phòng.
-2. Bật màn hình LCD. Lúc này màn hình sẽ hiện:
+2. Khi chưa có ai đứng trong khung hình, màn hình LCD 16×2 hiển thị:
    ```text
-   SmartScale Ready
-   Step on scale...
+   No people
+   detected
    ```
-3. Người dùng đứng lên cân **Mi Scale 2**:
-   - Màn hình cân LED sáng lên và chốt số đo cân nặng.
-   - Bo mạch YOLO UNO bắt sóng BLE, rung chuông hoặc nhấp nháy đèn xác nhận.
-   - Dòng 1 màn hình LCD cập nhật: `W: 65.4kg  ...`
-4. Camera OhStem tự động ghi hình người đứng:
-   - ESP32-S3 nạp ảnh trực tiếp qua Wi-Fi, chạy mô hình YOLO26n INT8 trong ~700ms.
-   - Nhận diện đỉnh đầu, tính toán khoảng cách và chiều cao theo mô hình Pinhole Camera.
-   - Dòng 1 cập nhật chiều cao: `W: 65.4kg H: 172cm`
-   - Dòng 2 tự động tính toán chỉ số BMI: `BMI: 22.1 (Normal)`
+3. Người dùng bước vào khung hình camera và đứng lên cân **Mi Scale 2**:
+   - Bo mạch YOLO UNO nhận ảnh từ camera qua Wi-Fi (Core 0), chạy mô hình YOLO26n INT8 trên chip (Core 1) và làm mượt chiều cao theo trung vị khung hình.
+   - Đồng thời YOLO UNO nhận gói quảng bá BLE `0x181D` từ cân Mi Scale 2 (lọc theo địa chỉ MAC đã cấu hình).
+   - Màn hình LCD luân phiên mỗi 2,5 giây giữa:
+     - Trang 1: `H:172.0cm` / `W:65.40kg ...` (khi đang cân) hoặc `W:65.40kg LOCK` (khi cân đã chốt ổn định)
+     - Trang 2: `D:2.50m` / `BMI:22.11` (chỉ tính BMI khi đã có chiều cao hợp lệ và cân nặng đã `LOCK`)
+4. Bước xuống khỏi cân để đọc kết quả:
+   - Khi đã có đầy đủ H, W `LOCK` và BMI, kết quả được giữ lại thêm **12 giây** (`D:2.50m HOLD` / `BMI:22.11`) để người đo kịp bước xuống xem màn hình LCD trước khi quay về `No people / detected` (hoặc cập nhật ngay khi có người mới bước lên cân).
 5. Toàn bộ chu trình hoạt động hoàn toàn tự động, khép kín trên chip mà không cần máy tính phụ trợ!
 
 ---

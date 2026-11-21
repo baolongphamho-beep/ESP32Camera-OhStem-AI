@@ -16,9 +16,11 @@ firmware/backups/
 docs/camera_research/*.bin
 firmware/edge_yolo/build/
 firmware/edge_yolo/managed_components/
+firmware/edge_yolo/dependencies.lock
 firmware/edge_yolo/sdkconfig
 firmware/edge_yolo/sdkconfig.old
 firmware/edge_yolo/models/*.onnx
 firmware/edge_yolo/models/*.info
+firmware/edge_yolo/models/*.json
 !firmware/edge_yolo/models/*.espdl
 !firmware/edge_yolo/models/*.build.json
