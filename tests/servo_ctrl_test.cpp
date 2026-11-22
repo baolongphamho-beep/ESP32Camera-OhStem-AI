@@ -26,12 +26,24 @@ int main() {
     assert(!isValidServoPin(46)); // Strapping
     assert(!isValidServoPin(49));
 
+    // Hardware-calibrated defaults (TIANKONGRC 20kg 180-deg on D7 / GPIO 10).
+    assert(kServoDefaultPin == 10);
+    assert(std::fabs(kServoDefaultMinDeg - 45.0f) < 0.001f);
+    assert(std::fabs(kServoDefaultMaxDeg - 135.0f) < 0.001f);
+    assert(std::fabs(kServoDefaultLevelDeg - 90.0f) < 0.001f);
+    assert(std::fabs(kServoDefaultBottomDeg - 112.0f) < 0.001f);
+    assert(std::fabs(kServoDefaultTopDeg - 85.0f) < 0.001f);
+    assert(kServoDefaultDir == 1);
+    assert(kServoDefaultSettleMs == 200U);
+
     // Mechanical angle clamping and invalid input fallback.
     assert(std::fabs(clampServoDeg(90.0f, 40.0f, 140.0f) - 90.0f) < 0.001f);
     assert(std::fabs(clampServoDeg(10.0f, 40.0f, 140.0f) - 40.0f) < 0.001f);
     assert(std::fabs(clampServoDeg(175.0f, 40.0f, 140.0f) - 140.0f) < 0.001f);
     assert(std::fabs(clampServoDeg(std::numeric_limits<float>::quiet_NaN(), 40.0f, 140.0f) - 90.0f) < 0.001f);
-    assert(std::fabs(clampServoDeg(100.0f, 140.0f, 40.0f) - 100.0f) < 0.001f); // Inverted bounds fall back to 40..140
+    assert(std::fabs(clampServoDeg(100.0f, 140.0f, 40.0f) - 100.0f) < 0.001f); // Inverted bounds fall back to 45..135
+    assert(std::fabs(clampServoDeg(10.0f, 140.0f, 40.0f) - 45.0f) < 0.001f);
+    assert(std::fabs(clampServoDeg(175.0f, 140.0f, 40.0f) - 135.0f) < 0.001f);
 
     // Pulse width (500..2500 us) and 50 Hz 14-bit duty conversion.
     assert(std::fabs(servoDegToPulseUs(0.0f) - 500.0f) < 0.001f);
@@ -50,6 +62,8 @@ int main() {
 
     assert(std::fabs(servoDegToTiltDeg(112.0f, 90.0f, 1) - 22.0f) < 0.001f);
     assert(std::fabs(servoDegToTiltDeg(85.0f, 90.0f, 1) - (-5.0f)) < 0.001f);
+    assert(std::fabs(servoDegToTiltDeg(kServoDefaultBottomDeg, kServoDefaultLevelDeg, kServoDefaultDir) - 22.0f) < 0.001f);
+    assert(std::fabs(servoDegToTiltDeg(kServoDefaultTopDeg, kServoDefaultLevelDeg, kServoDefaultDir) - (-5.0f)) < 0.001f);
     assert(std::fabs(servoDegToTiltDeg(90.0f, 90.0f, -1, 1.5f) - 1.5f) < 0.001f);
     assert(std::fabs(servoDegToTiltDeg(0.0f, 90.0f, -1) - 79.0f) < 0.001f); // Clamped below 80 deg
 

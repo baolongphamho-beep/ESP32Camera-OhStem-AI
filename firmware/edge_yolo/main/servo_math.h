@@ -11,13 +11,13 @@ static constexpr float kServoHardMinDeg = 0.0f;
 static constexpr float kServoHardMaxDeg = 180.0f;
 
 static constexpr int8_t kServoDefaultPin = 10;       // YOLO UNO D7
-static constexpr float kServoDefaultMinDeg = 40.0f;   // Mechanical safety lower bound (deg)
-static constexpr float kServoDefaultMaxDeg = 140.0f;  // Mechanical safety upper bound (deg)
+static constexpr float kServoDefaultMinDeg = 45.0f;   // Mechanical safety lower bound (deg)
+static constexpr float kServoDefaultMaxDeg = 135.0f;  // Mechanical safety upper bound (deg)
 static constexpr float kServoDefaultLevelDeg = 90.0f; // Servo angle where camera is horizontal (0 deg tilt)
-static constexpr float kServoDefaultBottomDeg = 68.0f;
-static constexpr float kServoDefaultTopDeg = 95.0f;
+static constexpr float kServoDefaultBottomDeg = 112.0f; // Looking down (+22 deg tilt with dir=+1)
+static constexpr float kServoDefaultTopDeg = 85.0f;     // Looking up (-5 deg tilt with dir=+1)
 static constexpr float kServoDefaultStepDeg = 4.5f;
-static constexpr int8_t kServoDefaultDir = -1;
+static constexpr int8_t kServoDefaultDir = 1;         // +1: higher servo deg tilts camera DOWN (TIANKONGRC 20kg 180-deg)
 static constexpr uint16_t kServoDefaultSettleMs = 200U;
 
 static constexpr float kServoRampMaxStepDeg = 2.0f;

@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ServoTest -Flash -Port COM16
 ```
 
-Có thể bỏ `-Flash -Port COM16` nếu chỉ muốn biên dịch kiểm tra (mặc định `-StandbyScanPercent 10`, có thể truyền `25`, `50`, `100` nếu muốn đo riêng). Với `-ServoTest`, chạy `python camera/servo_bench.py --port COM16` (hoặc dùng venv `D:\PROJECT\.venv\Scripts\python.exe`) và gửi `help`, `90`, `sweep`, `detach`, `set servo_level=92 servo_dir=-1` để căn góc ngang và kiểm tra sụt áp trước khi ghép FSM ở Phase 3. Để theo dõi riêng trạng thái nguồn/CPU/BLE/LCD (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM16`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
+Có thể bỏ `-Flash -Port COM16` nếu chỉ muốn biên dịch kiểm tra (mặc định `-StandbyScanPercent 10`, có thể truyền `25`, `50`, `100` nếu muốn đo riêng). Với `-ServoTest`, chạy `python camera/servo_bench.py --port COM16` (hoặc dùng venv `D:\PROJECT\.venv\Scripts\python.exe`) và gửi `help`, `90`, `sweep`, `detach`, `set servo_level=90 servo_dir=1` để căn góc ngang và kiểm tra sụt áp trước khi ghép FSM ở Phase 3. Để theo dõi riêng trạng thái nguồn/CPU/BLE/LCD (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM16`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
 
 Lệnh thứ hai thay chương trình trên UNO bằng firmware này, có ghi bootloader/bảng phân vùng mới. Script không tự xóa NVS. Firmware Arduino/PlatformIO vẫn nằm nguyên trong project và có thể nạp lại bằng environment cũ.
 

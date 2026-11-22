@@ -106,7 +106,7 @@ def parse_user_command(text):
         tokens = stripped[3:].strip().split()
         if not tokens:
             raise ValueError(
-                "Usage: set key=value [key=value ...], e.g. set servo_level=92 servo_dir=-1"
+                "Usage: set key=value [key=value ...], e.g. set servo_level=90 servo_dir=1"
             )
         values = {}
         for token in tokens:
@@ -217,7 +217,7 @@ def main():
             print(
                 f"Connected to {args.port} (-ServoTest bench). "
                 "Type degree (e.g. 90), bottom/top/level/sweep/detach/status, "
-                "'set servo_level=92 servo_dir=-1', or quit.",
+                "'set servo_level=90 servo_dir=1', or quit.",
                 flush=True,
             )
             port.write(b"SERVO STATUS\n")
