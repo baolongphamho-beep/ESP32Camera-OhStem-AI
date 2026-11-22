@@ -8,7 +8,7 @@ idf_component_register(SRCS "app_main.cpp" "edge_io.cpp" "servo_ctrl.cpp"
              esp_driver_i2c esp_driver_ledc esp_driver_gpio esp_driver_usb_serial_jtag
              bt esp_timer esp_rom esp_pm esp_hw_support)
 target_add_binary_data(${COMPONENT_LIB} "${MODEL_FILE}" BINARY)
-set(SMARTSCALE_STANDBY_SCAN_PERCENT "10" CACHE STRING "Standby BLE scan duty: 10, 25, 50, 100")
+set(SMARTSCALE_STANDBY_SCAN_PERCENT "100" CACHE STRING "Standby BLE scan duty: 10, 25, 50, 100")
 if(NOT SMARTSCALE_STANDBY_SCAN_PERCENT MATCHES "^(10|25|50|100)$")
     message(FATAL_ERROR "SMARTSCALE_STANDBY_SCAN_PERCENT must be 10, 25, 50 or 100")
 endif()
