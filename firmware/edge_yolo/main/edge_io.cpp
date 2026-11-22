@@ -60,6 +60,8 @@ static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static std::atomic<bool> s_power_active{true};
 static esp_pm_lock_handle_t s_active_cpu_lock = nullptr;
 static esp_pm_lock_handle_t s_active_sleep_lock = nullptr;
+static esp_pm_lock_handle_t s_ble_listen_lock = nullptr;
+static std::atomic<bool> s_ble_listen_held{false};
 static esp_pm_lock_handle_t s_usb_sleep_lock = nullptr;
 static std::atomic<bool> s_usb_sleep_blocked{true};
 static SemaphoreHandle_t s_control_wake_sem = nullptr;
@@ -1059,16 +1061,6 @@ void lcdMessage(const char* first, const char* second) {
     xSemaphoreGive(s_lcd_mutex);
 }
 
-void lcdClearMessage() {
-    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-    s_lcd_override_active = false;
-    s_lcd_override_until = 0;
-    xSemaphoreGive(s_lcd_mutex);
-    if (s_lcd_wake_sem) {
-        xSemaphoreGive(s_lcd_wake_sem);
-    }
-}
-
 void lcdSetBacklight(bool on) {
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
     const bool prev = s_lcd_backlight;
@@ -1294,6 +1286,7 @@ static void initPowerManagement() {
     // BLE, Wi-Fi, I2C and USB remain responsible for their driver constraints.
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "edge_active_cpu", &s_active_cpu_lock));
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_active", &s_active_sleep_lock));
+    ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_ble_listen", &s_ble_listen_lock));
     ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "edge_usb", &s_usb_sleep_lock));
     ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
     ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
@@ -1331,6 +1324,7 @@ EdgePowerView powerSnapshot() {
     out.wifiStarted = s_wifi_started.load();
     out.lcdBacklight = s_lcd_backlight_state.load();
     out.noLightSleepLocks = (s_power_active.load() ? 1 : 0) +
+                            (s_ble_listen_held.load() ? 1 : 0) +
                             (s_usb_sleep_blocked.load() ? 1 : 0);
     wifi_ps_type_t ps;
     if (esp_wifi_get_ps(&ps) == ESP_OK) {
@@ -1352,10 +1346,25 @@ void setPowerMode(bool active, bool keepLcdOn) {
         configureCpuPower(true);
         ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_cpu_lock));
         ESP_ERROR_CHECK(esp_pm_lock_acquire(s_active_sleep_lock));
+        // Active HTTP capture needs the radio. The listen lock only exists so
+        // standby scanning is not sliced by auto light sleep.
+        if (s_ble_listen_held.exchange(false)) {
+            ESP_ERROR_CHECK(esp_pm_lock_release(s_ble_listen_lock));
+        }
+        ESP_ERROR_CHECK(esp_coex_preference_set(ESP_COEX_PREFER_WIFI));
         xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
         s_lcd_override_until = 0;
         s_lcd_override_active = false;
         xSemaphoreGive(s_lcd_mutex);
+    } else {
+        // Grab the listen lock before dropping the active lock, so the first
+        // standby scan is not clipped by a light-sleep cycle.
+        if (!s_ble_listen_held.exchange(true)) {
+            ESP_ERROR_CHECK(esp_pm_lock_acquire(s_ble_listen_lock));
+        }
+        // Balance, not PREFER_WIFI: a beacon must not erase the scale burst,
+        // and PREFER_BT would drop the association the first capture needs.
+        ESP_ERROR_CHECK(esp_coex_preference_set(ESP_COEX_PREFER_BALANCE));
     }
     s_power_active.store(active);
     applyWifiPowerSave(active);
@@ -1452,15 +1461,27 @@ static void bleStartScan() {
     struct ble_gap_disc_params disc_params = {};
     disc_params.filter_duplicates = 0;
     disc_params.passive = 1;
-    // Use a fast 100 ms interval (160 * 0.625 ms) in standby so all 3 BLE
-    // advertising channels (37, 38, 39) are swept within 300 ms for instant wakeup.
-    disc_params.itvl = 160;
-    disc_params.window = standby ? (160 * EDGE_STANDBY_SCAN_PERCENT / 100) : 160;
+    if (standby) {
+        // Mi Scale 2 emits a few-millisecond burst on channels 37/38/39 about
+        // once a second, and only after its own LCD has locked. A 10 ms
+        // window every 100 ms misses that burst for seconds. Listen in 100 ms
+        // slots; a duty below 100% inserts a gap *between* slots instead of
+        // shrinking the slot. The default duty is 100% (continuous).
+        constexpr uint16_t kListenSlot = 160; // 160 * 0.625 ms = 100 ms
+        disc_params.window = kListenSlot;
+        disc_params.itvl = (EDGE_STANDBY_SCAN_PERCENT >= 100)
+            ? kListenSlot
+            : static_cast<uint16_t>(kListenSlot * 100 / EDGE_STANDBY_SCAN_PERCENT);
+    } else {
+        disc_params.itvl = 160;
+        disc_params.window = 160;
 #ifndef EDGE_SCALE_ONLY
-    // Keep BLE listening during HTTP instead of cancelling discovery. Retain
-    // 25 ms window every 200 ms (12.5% duty cycle) in active camera mode.
-    if (!standby) { disc_params.itvl = 320; disc_params.window = 40; }
+        // Keep BLE listening during HTTP instead of cancelling discovery.
+        // 25 ms window every 200 ms (12.5%) once the session is already awake.
+        disc_params.itvl = 320;
+        disc_params.window = 40;
 #endif
+    }
     const int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params,
                                bleGapEventHandler, nullptr);
     if (rc == 0) {
