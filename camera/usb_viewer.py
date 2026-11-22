@@ -7,6 +7,7 @@ import time
 from usb_protocol import Parser, SessionFilter, config_commands
 
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
+_RESERVED_SERVO_PINS = {11, 12, 19, 20, 43, 44, 45, 46} | set(range(22, 38))
 
 
 def validate_mac(text):
@@ -28,6 +29,79 @@ def validate_hold_sec(text, default=10):
     if not 0 <= value <= 60:
         raise ValueError("Thoi gian giu ket qua phai la so nguyen tu 0 den 60 giay.")
     return value
+
+
+def validate_servo_pin(text, default=None):
+    stripped = text.strip()
+    if not stripped:
+        return default
+    if not re.fullmatch(r"-?[0-9]+", stripped):
+        raise ValueError("Chan servo phai la -1 (tat) hoac so GPIO hop le (0..48).")
+    pin = int(stripped)
+    if pin == -1:
+        return -1
+    if not 0 <= pin <= 48 or pin in _RESERVED_SERVO_PINS:
+        raise ValueError("GPIO servo khong hop le hoac trung I2C/USB/Flash/UART.")
+    return pin
+
+
+def validate_servo_dir(text, default=1):
+    stripped = text.strip()
+    if not stripped:
+        return default
+    if stripped in {"1", "+1"}:
+        return 1
+    if stripped == "-1":
+        return -1
+    raise ValueError("Chieu servo_dir chi nhan 1 hoac -1.")
+
+
+def validate_servo_settle(text, default=200):
+    stripped = text.strip()
+    if not stripped:
+        return default
+    if not re.fullmatch(r"[0-9]+", stripped):
+        raise ValueError("Thoi gian cho het rung servo_settle phai tu 50 den 2000 ms.")
+    value = int(stripped)
+    if not 50 <= value <= 2000:
+        raise ValueError("Thoi gian cho het rung servo_settle phai tu 50 den 2000 ms.")
+    return value
+
+
+def _is_finite_number(value):
+    return (value is not None and not isinstance(value, bool)
+            and isinstance(value, (int, float)) and math.isfinite(value))
+
+
+def format_servo_line(metadata):
+    if not any(k in metadata for k in ("phase", "servo_deg", "tilt_deg", "framing")):
+        return None
+    parts = []
+    phase = metadata.get("phase")
+    if phase:
+        parts.append(f"Phase: {phase}")
+    servo_deg = metadata.get("servo_deg")
+    tilt_deg = metadata.get("tilt_deg")
+    if _is_finite_number(servo_deg):
+        off_tag = " [OFF]" if metadata.get("servo_attached") is False else ""
+        if _is_finite_number(tilt_deg):
+            parts.append(f"Servo: {servo_deg:.1f} deg{off_tag} (tilt {tilt_deg:+.1f} deg)")
+        else:
+            parts.append(f"Servo: {servo_deg:.1f} deg{off_tag}")
+    elif _is_finite_number(tilt_deg):
+        parts.append(f"Tilt: {tilt_deg:+.1f} deg")
+    framing = metadata.get("framing")
+    if framing:
+        parts.append(f"Frame: {framing}")
+    return " | ".join(parts) if parts else None
+
+
+def framing_box_color(framing):
+    if framing == "TOO_CLOSE":
+        return (0, 0, 255)
+    if framing in {"TOP_CLIPPED", "BOTTOM_CLIPPED", "SIDE_CLIPPED"}:
+        return (0, 165, 255)
+    return (0, 255, 0)
 
 
 def format_metric(value, unit="", fmt=".1f"):
@@ -147,7 +221,47 @@ def configure():
             print(exc)
 
     while True:
-        mode = input("Che do fixed / ground [fixed]: ").strip().lower() or "fixed"
+        servo_raw = input("GPIO servo (Enter = giu nguyen, 10 = D7, -1 = tat servo): ")
+        try:
+            servo_pin = validate_servo_pin(servo_raw, default=None)
+            break
+        except ValueError as exc:
+            print(exc)
+
+    if servo_pin is not None:
+        values["servo_pin"] = servo_pin
+        if servo_pin != -1:
+            servo_min = ask_number("Gioi han duoi co khi servo_min (do)", 45, 0, 179)
+            servo_max = ask_number("Gioi han tren co khi servo_max (do)", max(servo_min + 1, 135), servo_min + 1, 180)
+            values["servo_min"] = servo_min
+            values["servo_max"] = servo_max
+            values["servo_level"] = ask_number("Goc servo nam ngang servo_level (do)", 90, 0, 180)
+            while True:
+                dir_raw = input("Chieu quay servo_dir (+1 = tang goc chui xuong, -1 = nguoc lai) [1]: ")
+                try:
+                    servo_dir = validate_servo_dir(dir_raw, default=1)
+                    values["servo_dir"] = servo_dir
+                    break
+                except ValueError as exc:
+                    print(exc)
+            default_bottom = 112 if servo_dir == 1 else 68
+            default_top = 85 if servo_dir == 1 else 95
+            default_bottom = min(max(default_bottom, servo_min), servo_max)
+            default_top = min(max(default_top, servo_min), servo_max)
+            values["servo_bottom"] = ask_number("Goc bat dau quet phia duoi servo_bottom (do)", default_bottom, servo_min, servo_max)
+            values["servo_top"] = ask_number("Goc quet cao nhat servo_top (do)", default_top, servo_min, servo_max)
+            values["servo_step"] = ask_number("Buoc quet servo_step (do)", 4.5, 1, 30)
+            while True:
+                settle_raw = input("Thoi gian cho het rung servo_settle (ms, 50..2000) [200]: ")
+                try:
+                    values["servo_settle"] = validate_servo_settle(settle_raw, default=200)
+                    break
+                except ValueError as exc:
+                    print(exc)
+
+    default_mode = "ground" if (servo_pin is not None and servo_pin != -1) else "fixed"
+    while True:
+        mode = input(f"Che do fixed / ground [{default_mode}]: ").strip().lower() or default_mode
         if mode in {"fixed", "ground"}:
             values["mode"] = mode
             break
@@ -162,7 +276,7 @@ def configure():
         values["tilt"] = 0
     else:
         values["height"] = ask_number("Tam camera cao hon mat can (cm)", 100, 1, 400)
-        values["tilt"] = ask_number("Goc nghieng xuong (do, duong = xuong)", 0, -79, 79)
+        values["tilt"] = ask_number("Goc nghieng bu tilt_offset (do, 0 neu da chuan servo_level)", 0, -79, 79)
         values["focal"] = ask_number("fy/H (lay tu hieu chuan camera)", 1, .01, 20)
 
     while True:
@@ -230,6 +344,13 @@ def main():
                         phase = metadata.get("phase", "Waiting")
                         notice = (f"{phase} | CPU: {metadata.get('cpu_mhz')} MHz | "
                                   f"BLE: {metadata.get('ble_duty_percent')}%")
+                        servo_deg = metadata.get("servo_deg")
+                        tilt_deg = metadata.get("tilt_deg")
+                        if _is_finite_number(servo_deg):
+                            if _is_finite_number(tilt_deg):
+                                notice += f" | Servo: {servo_deg:.1f} deg (tilt {tilt_deg:+.1f} deg)"
+                            else:
+                                notice += f" | Servo: {servo_deg:.1f} deg"
                         if phase == "RESULT_HOLD":
                             notice += (f" | H: {format_metric(metadata.get('height_cm'), 'cm', '.1f')}  "
                                        f"W: {format_metric(metadata.get('weight_kg'), 'kg', '.2f')}  "
@@ -259,15 +380,16 @@ def main():
                     metadata, jpeg = latest_frame
                     image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
                     if image is not None:
+                        box_color = framing_box_color(metadata.get("framing"))
                         for box in metadata.get("boxes", []):
                             if len(box) < 5:
                                 continue
                             x1, y1, x2, y2, confidence = box[:5]
                             p1 = (round(x1), round(y1))
                             p2 = (round(x2), round(y2))
-                            cv2.rectangle(image, p1, p2, (0, 255, 0), 2)
+                            cv2.rectangle(image, p1, p2, box_color, 2)
                             cv2.putText(image, f"{confidence:.2f}", (p1[0], max(15, p1[1] - 6)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1)
                         canvas = cv2.resize(image, (800, round(image.shape[0] * 800 / image.shape[1])))
                         timing = format_timing_line(metadata)
                         weight_kg = metadata.get("weight_kg")
@@ -280,6 +402,13 @@ def main():
                             f"Weight: {format_metric(weight_kg, 'kg', '.2f')} ({weight_state})   BMI: {format_metric(metadata.get('bmi'), '', '.2f')}",
                             timing,
                         ]
+                        servo_line = format_servo_line(metadata)
+                        if servo_line is not None:
+                            lines.append(servo_line)
+                        hud_h = min(canvas.shape[0], 15 + 25 * len(lines))
+                        overlay = canvas[:hud_h].copy()
+                        overlay[:] = (0, 0, 0)
+                        cv2.addWeighted(overlay, 0.45, canvas[:hud_h], 0.55, 0, canvas[:hud_h])
                         for i, line in enumerate(lines):
                             cv2.putText(canvas, line, (10, 25 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
                         background = canvas

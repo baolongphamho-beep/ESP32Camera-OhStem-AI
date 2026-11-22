@@ -4,6 +4,7 @@
 #include "http_capture_parser.h"
 #include "servo_ctrl.h"
 #include "standby_schedule.h"
+#include "step_scan_fsm.h"
 #include "dl_model_base.hpp"
 #include "yolo26.hpp"
 #include "esp_heap_caps.h"
@@ -51,7 +52,13 @@ static void powerTelemetry(const char* phase, uint32_t generation, const Measure
     const auto scale = held ? *held : scaleSnapshot();
     const auto power = powerSnapshot();
     const auto cfg = configSnapshot();
-    char json[768], weight[24] = "null", height[24] = "null", distance[24] = "null", bmi[24] = "null";
+    const bool servoReady = servoIsInitialized();
+    const bool servoAttached = servoReady && servoIsAttached();
+    const float curServoDeg = servoReady ? servoCurrentDeg() : cfg.servoLevelDeg;
+    const float curTiltDeg = servoReady ? servoToTiltDeg(curServoDeg, cfg) : cfg.tiltDeg;
+    char json[896], weight[24] = "null", height[24] = "null", distance[24] = "null", bmi[24] = "null",
+         servoDegStr[24] = "null";
+    if (servoReady) snprintf(servoDegStr, sizeof(servoDegStr), "%.1f", curServoDeg);
     if (scale.hasHeight) {
         snprintf(height, sizeof(height), "%.1f", scale.heightCm);
         snprintf(distance, sizeof(distance), "%.3f", scale.distanceM);
@@ -64,13 +71,15 @@ static void powerTelemetry(const char* phase, uint32_t generation, const Measure
         "\"cpu_min_mhz\":%d,\"cpu_max_mhz\":%d,\"light_sleep_enabled\":%s,"
         "\"usb_sleep_blocked\":%s,\"no_ls_locks\":%d,\"wifi_ps\":\"%s\",\"wifi_started\":%s,"
         "\"lcd_backlight\":%s,\"hold_sec\":%u,"
-        "\"height_cm\":%s,\"distance_m\":%s,\"bmi\":%s}",
+        "\"height_cm\":%s,\"distance_m\":%s,\"bmi\":%s,"
+        "\"servo_deg\":%s,\"tilt_deg\":%.1f,\"servo_attached\":%s}",
         phase, static_cast<unsigned long>(generation), bleScanDutyPercent(), weight,
         scale.weightStable ? "true" : "false", power.pmEnabled ? "true" : "false", power.cpuMhz,
         power.minCpuMhz, power.maxCpuMhz, power.lightSleepConfigured ? "true" : "false",
         power.usbSleepBlocked ? "true" : "false", power.noLightSleepLocks, power.wifiPowerSave,
         power.wifiStarted ? "true" : "false", power.lcdBacklight ? "true" : "false",
-        static_cast<unsigned>(cfg.holdSec), height, distance, bmi);
+        static_cast<unsigned>(cfg.holdSec), height, distance, bmi,
+        servoDegStr, curTiltDeg, servoAttached ? "true" : "false");
     usbFrame(nullptr, 0, json);
 }
 
@@ -584,7 +593,10 @@ static uint32_t s_ready_capture_ms = 0;
 static uint32_t s_consecutive_failures = 0;
 static CaptureError s_last_error;
 static CaptureGate s_gate;
+static ServoCaptureSync s_servo_sync;
 static uint32_t s_ready_generation = 0;
+static float s_ready_servo_deg = kServoDefaultLevelDeg;
+static uint32_t s_ready_pose_epoch = 0;
 static uint32_t s_requested_scale_session = 0;
 static MeasurementView s_last_result;
 static bool s_have_result = false;
@@ -599,7 +611,7 @@ struct CaptureLease {
         active = false;
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
         s_gate.finishCapture(token);
-        const bool canSleep = s_gate.canSleep();
+        const bool canSleep = s_gate.canSleep() && s_servo_sync.canSleep();
         xSemaphoreGive(s_capture_mutex);
         if (canSleep) {
             edgeNotifyControl();
@@ -614,7 +626,7 @@ struct InferenceLease {
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
         s_busy_idx = -1;
         s_gate.finishInference(token);
-        const bool canSleep = s_gate.canSleep();
+        const bool canSleep = s_gate.canSleep() && s_servo_sync.canSleep();
         xSemaphoreGive(s_capture_mutex);
         if (canSleep) {
             edgeNotifyControl();
@@ -622,13 +634,87 @@ struct InferenceLease {
     }
 };
 
-static void requestCapture(bool active, uint32_t scaleSession) {
+struct ServoMoveLease {
+    bool active = true;
+    void disarm() { active = false; }
+    ~ServoMoveLease() {
+        if (!active) return;
+        xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+        s_servo_sync.abortHardwareMove();
+        const bool canSleep = s_gate.canSleep() && s_servo_sync.canSleep();
+        xSemaphoreGive(s_capture_mutex);
+        if (canSleep) {
+            edgeNotifyControl();
+        }
+    }
+};
+
+static void setActivePhaseIfEnabled(const char* phase) {
+    if (!phase) return;
+    bool changed = false;
+    xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+    if (s_gate.enabled()) {
+        const char* cur = s_system_phase.load();
+        if (!cur || strcmp(cur, phase) != 0) {
+            s_system_phase.store(phase);
+            changed = true;
+        }
+    }
+    xSemaphoreGive(s_capture_mutex);
+    if (changed) {
+        edgeNotifyControl();
+    }
+}
+
+static bool executeServoMove(float targetDeg, uint32_t settleMs, uint8_t flushFrames) {
+    xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+    if (!s_gate.enabled()) {
+        xSemaphoreGive(s_capture_mutex);
+        return false;
+    }
+    s_servo_sync.beginHardwareMove();
+    s_ready_idx = -1;
+    while (xSemaphoreTake(s_capture_sem, 0) == pdTRUE) {}
+    xSemaphoreGive(s_capture_mutex);
+
+    ServoMoveLease moveLease{true};
+    servoMoveDeg(targetDeg, settleMs);
+    const bool attached = servoIsAttached();
+    const float settledDeg = servoCurrentDeg();
+
+    xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+    const bool stillEnabled = s_gate.enabled();
+    if (stillEnabled && attached) {
+        s_servo_sync.endHardwareMove(settledDeg, flushFrames);
+        s_ready_idx = -1;
+        while (xSemaphoreTake(s_capture_sem, 0) == pdTRUE) {}
+        moveLease.disarm();
+        xSemaphoreGive(s_capture_mutex);
+        if (s_capture_wake_sem) {
+            xSemaphoreGive(s_capture_wake_sem);
+        }
+        return true;
+    }
+    xSemaphoreGive(s_capture_mutex);
+    servoDetach();
+    return false;
+}
+
+static void requestCapture(bool active, uint32_t scaleSession, bool useServo, const char* nextPhase) {
     bool changed = false;
     xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
     if (s_gate.request(active, scaleSession)) {
         s_ready_idx = -1;
         s_consecutive_failures = 0;
         while (xSemaphoreTake(s_capture_sem, 0) == pdTRUE) {}
+        if (active) {
+            s_servo_sync.onSessionStart(useServo);
+        } else {
+            s_servo_sync.onSessionStop();
+        }
+        if (nextPhase) {
+            s_system_phase.store(nextPhase);
+        }
         changed = true;
     }
     s_requested_scale_session = scaleSession;
@@ -636,6 +722,7 @@ static void requestCapture(bool active, uint32_t scaleSession) {
     if (changed) {
         if (s_capture_wake_sem) xSemaphoreGive(s_capture_wake_sem);
         if (active && s_infer_wake_sem) xSemaphoreGive(s_infer_wake_sem);
+        if (!active && s_capture_sem) xSemaphoreGive(s_capture_sem);
     }
 }
 
@@ -644,14 +731,18 @@ static void integrationControlTask(void* arg) {
     uint32_t session = 0, holdAt = 0, lastReportAt = 0, lastGeneration = UINT32_MAX;
     const char* lastPhase = nullptr;
     float lastBleDuty = -1.0f;
+    float lastServoDeg = -999.0f;
+    bool lastServoAttached = false;
     while (true) {
 #ifdef EDGE_CAMERA_CONTINUOUS
         const bool active = true;
         const uint32_t wantedSession = 0;
+        const bool useServo = false;
 #else
         const auto sample = scaleSampleSnapshot();
         const bool active = sample.present();
         const uint32_t wantedSession = sample.sessionId;
+        const bool useServo = servoIsInitialized();
 #endif
         const uint32_t holdMs = static_cast<uint32_t>(configSnapshot().holdSec) * 1000U;
         if (active && (!requested || wantedSession != session)) {
@@ -660,28 +751,28 @@ static void integrationControlTask(void* arg) {
             xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
             s_have_result = false;
             xSemaphoreGive(s_capture_mutex);
-            requestCapture(true, wantedSession);
+#ifdef EDGE_CAMERA_CONTINUOUS
+            const char* initialPhase = "CONTINUOUS";
+#else
+            const char* initialPhase = useServo ? "WAKING_HOMING" : "ACTIVE";
+#endif
+            requestCapture(true, wantedSession, useServo, initialPhase);
             requested = true;
             session = wantedSession;
             holding = false;
-#ifdef EDGE_CAMERA_CONTINUOUS
-            s_system_phase.store("CONTINUOUS");
-#else
-            s_system_phase.store("ACTIVE");
-#endif
         } else if (!active && requested) {
-            requestCapture(false, session);
+            requestCapture(false, session, false, "DRAINING");
             requested = false;
-            s_system_phase.store("DRAINING");
         }
         if (!active) {
             xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-            const bool idle = s_gate.canSleep();
+            const bool idle = s_gate.canSleep() && s_servo_sync.canSleep();
             const bool hasResult = s_have_result;
             const auto result = s_last_result;
             xSemaphoreGive(s_capture_mutex);
             // Both workers must release their buffers/HTTP handles before DFS.
             if (idle && powerModeActive()) {
+                servoDetach();
                 if (hasResult && holdMs > 0) {
                     lcdHoldResult(&result);
                     setPowerMode(false, /*keepLcdOn=*/true);
@@ -712,7 +803,13 @@ static void integrationControlTask(void* arg) {
         const uint32_t now = clockMs();
         const bool usbConn = usbConnected();
         const float bleDuty = bleScanDutyPercent();
-        if (phase != lastPhase || generation != lastGeneration ||
+        const bool servoReady = servoIsInitialized();
+        const bool curServoAttached = servoReady && servoIsAttached();
+        const float curServoDeg = servoReady ? servoCurrentDeg() : -999.0f;
+        const bool phaseChanged = (!lastPhase || strcmp(phase, lastPhase) != 0);
+        const bool servoChanged = usbConn && servoReady &&
+            (std::fabs(curServoDeg - lastServoDeg) >= 0.05f || curServoAttached != lastServoAttached);
+        if (phaseChanged || generation != lastGeneration || servoChanged ||
             (usbConn && (std::fabs(bleDuty - lastBleDuty) >= 0.05f ||
                          now - lastReportAt >= kControlReportIntervalMs))) {
             powerTelemetry(phase, generation, holding ? &heldResult : nullptr);
@@ -720,6 +817,8 @@ static void integrationControlTask(void* arg) {
             lastPhase = phase;
             lastGeneration = generation;
             lastBleDuty = bleDuty;
+            lastServoDeg = curServoDeg;
+            lastServoAttached = curServoAttached;
         }
         const uint32_t waitMs = computeControlWaitMs({
             now, lastReportAt, holdAt, holdMs,
@@ -772,16 +871,20 @@ static void captureWorkerTask(void* arg) {
 
         int write_idx = -1;
         uint32_t token = 0;
+        ServoCaptureSync::CaptureTicket syncTicket;
+        bool canCapNow = false;
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-        if (s_gate.enabled() && wifiReady() && s_ready_idx == -1 && s_gate.beginCapture(token)) {
+        canCapNow = s_gate.enabled() && wifiReady() && s_servo_sync.canCapture();
+        if (canCapNow && s_ready_idx == -1 && s_gate.beginCapture(token)) {
             write_idx = (s_busy_idx == 0) ? 1 : 0;
+            syncTicket = s_servo_sync.startCapture();
         }
         xSemaphoreGive(s_capture_mutex);
 
         if (write_idx < 0) {
-            // Wait on wake semaphore so stepping on the scale or consuming a
-            // ready frame triggers HTTP capture immediately (0 ms).
-            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(15));
+            // Wait on wake semaphore so stepping on the scale, servo settle,
+            // or consuming a ready frame triggers HTTP capture immediately (0 ms).
+            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(canCapNow ? 15 : 50));
             continue;
         }
 
@@ -819,7 +922,7 @@ static void captureWorkerTask(void* arg) {
         const bool accepted = s_gate.finishCapture(token);
         captureLease.active = false;
         if (!accepted) {
-            const bool canSleep = s_gate.canSleep();
+            const bool canSleep = s_gate.canSleep() && s_servo_sync.canSleep();
             xSemaphoreGive(s_capture_mutex);
             if (canSleep) {
                 edgeNotifyControl();
@@ -827,10 +930,22 @@ static void captureWorkerTask(void* arg) {
             continue;
         }
         if (length > 0) {
+            const auto disp = s_servo_sync.finishCaptureSuccess(syncTicket);
+            if (disp == ServoCaptureSync::CaptureDisposition::DropStale) {
+                xSemaphoreGive(s_capture_mutex);
+                continue;
+            }
+            if (disp == ServoCaptureSync::CaptureDisposition::ConsumedFlush) {
+                s_consecutive_failures = 0;
+                xSemaphoreGive(s_capture_mutex);
+                continue;
+            }
             s_ready_generation = token;
             s_ready_idx = write_idx;
             s_ready_len = length;
             s_ready_capture_ms = elapsed;
+            s_ready_servo_deg = syncTicket.servoDeg;
+            s_ready_pose_epoch = syncTicket.poseEpoch;
             s_consecutive_failures = 0;
             xSemaphoreGive(s_capture_mutex);
             xSemaphoreGive(s_capture_sem);
@@ -839,6 +954,7 @@ static void captureWorkerTask(void* arg) {
             const uint32_t breather_ms = std::clamp<uint32_t>(elapsed / 2, 150, 900);
             xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(breather_ms));
         } else {
+            s_servo_sync.finishCaptureError(syncTicket);
             ++s_consecutive_failures;
             s_last_error = err;
             const uint32_t fails = s_consecutive_failures;
@@ -1194,6 +1310,10 @@ extern "C" void app_main() {
     s_capture_wake_sem = xSemaphoreCreateBinary();
     s_infer_wake_sem = xSemaphoreCreateBinary();
     ESP_ERROR_CHECK(s_capture_mutex && s_capture_sem && s_capture_wake_sem && s_infer_wake_sem ? ESP_OK : ESP_ERR_NO_MEM);
+
+    const auto initialCfg = configSnapshot();
+    servoInitFromConfig(initialCfg);
+
     // Pin background HTTP capture to Core 0 (alongside Wi-Fi/lwIP) so Core 1
     // (app_main affinity) runs YOLO26n inference uninterrupted in parallel.
     ESP_ERROR_CHECK(xTaskCreatePinnedToCore(captureWorkerTask, "cam_cap", 6144, nullptr, 4, nullptr, 0)
@@ -1203,10 +1323,27 @@ extern "C" void app_main() {
 
     ESP_LOGI(TAG, "YOLO26n ready; free PSRAM=%u", unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
-    uint32_t lastConfigRev = configSnapshot().revision;
+    auto makeStepScanConfig = [](const EdgeConfig& cfg) {
+        StepScanConfig sc;
+        sc.minDeg = cfg.servoMinDeg;
+        sc.maxDeg = cfg.servoMaxDeg;
+        sc.bottomDeg = cfg.servoBottomDeg;
+        sc.topDeg = cfg.servoTopDeg;
+        sc.stepDeg = cfg.servoStepDeg;
+        return sc;
+    };
+
+    uint32_t lastConfigRev = initialCfg.revision;
     uint32_t lastReportedFails = 0;
+    uint32_t lastActiveSession = UINT32_MAX;
     HeightMedianFilter heightFilter;
     AutoCalibCollector calibCollector;
+    StepScanFsm stepFsm;
+    bool sessionHomed = false;
+    bool hasFrozenHeight = false;
+    float frozenHeightCm = 0.0f;
+    float frozenDistanceM = 0.0f;
+    bool prevLockedPhase = false;
     int consecutiveNone = 0;
     bool hadPerson = false;
     static constexpr int kNoneDebounceFrames = 3;
@@ -1214,9 +1351,18 @@ extern "C" void app_main() {
     while (true) {
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
         const bool enabled = s_gate.enabled();
+        const uint32_t currentScaleSession = s_requested_scale_session;
         xSemaphoreGive(s_capture_mutex);
         if (!enabled) {
+            if (sessionHomed || servoIsAttached()) {
+                servoDetach();
+            }
             lastReportedFails = 0;
+            lastActiveSession = UINT32_MAX;
+            sessionHomed = false;
+            prevLockedPhase = false;
+            hasFrozenHeight = false;
+            stepFsm.reset();
             heightFilter.reset();
             calibCollector.reset();
             consecutiveNone = 0;
@@ -1225,8 +1371,29 @@ extern "C" void app_main() {
             continue;
         }
 
+        const auto cfg = configSnapshot();
+        if (cfg.revision != lastConfigRev) {
+            lastConfigRev = cfg.revision;
+            servoInitFromConfig(cfg);
+            sessionHomed = false;
+            prevLockedPhase = false;
+            hasFrozenHeight = false;
+            stepFsm.reset();
+            heightFilter.reset();
+            calibCollector.reset();
+            consecutiveNone = 0;
+            hadPerson = false;
+        }
+
         if (!wifiReady()) {
+            if (servoIsAttached()) {
+                servoDetach();
+            }
             lastReportedFails = 0;
+            sessionHomed = false;
+            prevLockedPhase = false;
+            hasFrozenHeight = false;
+            stepFsm.reset();
             heightFilter.reset();
             calibCollector.reset();
             consecutiveNone = 0;
@@ -1239,46 +1406,88 @@ extern "C" void app_main() {
             continue;
         }
 
+#ifdef EDGE_CAMERA_CONTINUOUS
+        const bool servoMode = false;
+#else
+        const bool servoMode = (cfg.servoPin >= 0 && servoIsInitialized());
+#endif
+        if (!sessionHomed || currentScaleSession != lastActiveSession) {
+            stepFsm.reset();
+            heightFilter.reset();
+            calibCollector.reset();
+            hasFrozenHeight = false;
+            frozenHeightCm = 0.0f;
+            frozenDistanceM = 0.0f;
+            prevLockedPhase = false;
+            consecutiveNone = 0;
+            hadPerson = false;
+            lastActiveSession = currentScaleSession;
+            if (servoMode) {
+                const auto homeDec = stepFsm.beginSession(makeStepScanConfig(cfg));
+                setActivePhaseIfEnabled(scanPhaseName(stepFsm.phase()));
+                lcdMessage("Scanning...", "Homing camera");
+                if (!executeServoMove(homeDec.targetDeg, cfg.servoSettleMs, homeDec.flushFrames)) {
+                    continue;
+                }
+                stepFsm.onHomed(servoCurrentDeg());
+                setActivePhaseIfEnabled(scanPhaseName(stepFsm.phase()));
+                sessionHomed = true;
+            } else {
+                xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+                s_servo_sync.clearHomingPending(cfg.servoLevelDeg);
+                xSemaphoreGive(s_capture_mutex);
+                if (s_capture_wake_sem) {
+                    xSemaphoreGive(s_capture_wake_sem);
+                }
+                sessionHomed = true;
+            }
+        }
+
         xSemaphoreTake(s_capture_sem, pdMS_TO_TICKS(100));
 
         int buf_idx = -1;
         uint32_t token = 0;
         size_t length = 0;
         uint32_t captureMs = 0;
+        float frameServoDeg = cfg.servoLevelDeg;
         uint32_t fails = 0;
         CaptureError err;
+        bool stalePoseDiscarded = false;
 
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-        if (s_ready_idx >= 0 && s_gate.beginInference(s_ready_generation)) {
-            token = s_ready_generation;
-            buf_idx = s_ready_idx;
-            length = s_ready_len;
-            captureMs = s_ready_capture_ms;
-            s_busy_idx = buf_idx;
-            s_ready_idx = -1;
-        } else {
+        if (s_ready_idx >= 0) {
+            if (servoMode && s_ready_pose_epoch != s_servo_sync.poseEpoch()) {
+                s_ready_idx = -1;
+                stalePoseDiscarded = true;
+            } else if (s_gate.beginInference(s_ready_generation)) {
+                token = s_ready_generation;
+                buf_idx = s_ready_idx;
+                length = s_ready_len;
+                captureMs = s_ready_capture_ms;
+                frameServoDeg = s_ready_servo_deg;
+                s_busy_idx = buf_idx;
+                s_ready_idx = -1;
+            }
+        }
+        if (buf_idx < 0 && !stalePoseDiscarded) {
             fails = s_consecutive_failures;
             err = s_last_error;
         }
         xSemaphoreGive(s_capture_mutex);
-        if (buf_idx >= 0 && s_capture_wake_sem) {
+        if ((buf_idx >= 0 || stalePoseDiscarded) && s_capture_wake_sem) {
             xSemaphoreGive(s_capture_wake_sem);
         }
-
-        const auto cfg = configSnapshot();
-        if (cfg.revision != lastConfigRev) {
-            lastConfigRev = cfg.revision;
-            heightFilter.reset();
-            calibCollector.reset();
-            consecutiveNone = 0;
-            hadPerson = false;
+        if (stalePoseDiscarded) {
+            continue;
         }
 
         if (buf_idx < 0 || !length) {
             // Only report offline after 3+ consecutive failures so brief 1-2
             // packet Wi-Fi hiccups do not interrupt the live display or LCD.
             if (fails >= 3) {
-                heightFilter.reset();
+                if (!hasFrozenHeight) {
+                    heightFilter.reset();
+                }
                 calibCollector.reset();
                 consecutiveNone = 0;
                 hadPerson = false;
@@ -1305,185 +1514,312 @@ extern "C" void app_main() {
         }
         lastReportedFails = 0;
 
-        InferenceLease lease{token};
-        uint8_t* jpeg = s_jpeg_buffers[buf_idx];
-        const auto inferStarted = clockMs();
-        auto img = detector.decode_jpeg(jpeg, length);
-        if (!img.data) {
-            continue;
-        }
-        const int width = img.width, height = img.height;
-        if (kCameraTargetFramesize >= 0 && width > cameraTargetMaxWidth(kCameraTargetFramesize)) {
-            s_camera_res_dirty.store(true);
-        }
-        if (width <= 0 || height <= 0 || width > 1280 || height > 1024) {
-            heap_caps_free(img.data);
-            heightFilter.reset();
-            calibCollector.reset();
-            consecutiveNone = 0;
-            hadPerson = false;
-            cameraState(PersonStatus::None);
-            status("Use QVGA or VGA camera resolution");
-            continue;
-        }
-        detector.preprocess(img);
-        heap_caps_free(img.data); // Release RGB before inference.
-        model->run();
-        const auto results = detector.postprocess(model->get_outputs());
-        std::vector<PersonBox> people;
-        for (const auto& r : results) {
-            if (r.category == 0 && r.box.size() >= 4) {
-                people.push_back(originalBox({float(r.box[0]), float(r.box[1]),
-                    float(r.box[2]), float(r.box[3]), r.score}, width, height));
+        StepScanDecision servoDecision;
+        {
+            InferenceLease lease{token};
+            uint8_t* jpeg = s_jpeg_buffers[buf_idx];
+            const auto inferStarted = clockMs();
+            auto img = detector.decode_jpeg(jpeg, length);
+            if (!img.data) {
+                continue;
             }
-        }
-
-        PersonStatus person = PersonStatus::None;
-        const char* label = "No people detected";
-        float cm = 0, distance = 0;
-        bool updateCameraState = true;
-
-        if (people.empty()) {
-            if (hadPerson && ++consecutiveNone < kNoneDebounceFrames) {
-                // Tolerate 1-2 missed detections without clearing active scale weight/BMI.
-                label = "No people detected";
-                updateCameraState = false;
-            } else {
-                hadPerson = false;
+            const int width = img.width, height = img.height;
+            if (kCameraTargetFramesize >= 0 && width > cameraTargetMaxWidth(kCameraTargetFramesize)) {
+                s_camera_res_dirty.store(true);
+            }
+            if (width <= 0 || height <= 0 || width > 1280 || height > 1024) {
+                heap_caps_free(img.data);
+                if (!hasFrozenHeight) {
+                    heightFilter.reset();
+                }
+                calibCollector.reset();
                 consecutiveNone = 0;
-                heightFilter.reset();
-                calibCollector.reset();
+                hadPerson = false;
+                cameraState(PersonStatus::None);
+                status("Use QVGA or VGA camera resolution");
+                continue;
             }
-        } else if (people.size() > 1) {
-            consecutiveNone = 0;
-            hadPerson = false;
-            heightFilter.reset();
-            calibCollector.reset();
-            person = PersonStatus::Multiple;
-            label = "Multiple people";
-        } else {
-            consecutiveNone = 0;
-            hadPerson = true;
-            const auto& box = people.front();
-            person = PersonStatus::Partial;
-            label = "Show head and feet";
-            if (!fullBox(box, width, height)) {
-                calibCollector.reset();
-            } else {
-                person = PersonStatus::NeedsCalibration;
-                label = "Check calibration";
-                // Store focal in normalized image-height units, so a resolution
-                // change does not silently invalidate it (viewer calls it fy/H).
-                float focal = cfg.focalPx * height;
-                if (!cfg.groundMode && focal == 0 && std::fabs(cfg.tiltDeg) < .01f) {
-                    if (cfg.distanceM > 0 && cfg.referenceCm > 0) {
-                        float medBoxH = 0;
-                        if (calibCollector.add(box.y2 - box.y1, medBoxH)) {
-                            const float calibratedFocal = medBoxH * cfg.distanceM / (cfg.referenceCm / 100.0f);
-                            if (std::isfinite(calibratedFocal) && calibratedFocal > 0.0f) {
-                                focal = calibratedFocal;
-                                saveFocalIfUnchanged(cfg, focal / height);
+            detector.preprocess(img);
+            heap_caps_free(img.data); // Release RGB before inference.
+            model->run();
+            const auto results = detector.postprocess(model->get_outputs());
+            std::vector<PersonBox> people;
+            for (const auto& r : results) {
+                if (r.category == 0 && r.box.size() >= 4) {
+                    people.push_back(originalBox({float(r.box[0]), float(r.box[1]),
+                        float(r.box[2]), float(r.box[3]), r.score}, width, height));
+                }
+            }
+
+            const float frameTiltDeg = servoMode ? servoToTiltDeg(frameServoDeg, cfg) : cfg.tiltDeg;
+            const FramingStatus framing = (people.size() == 1)
+                ? analyzeFraming(people.front(), width, height)
+                : FramingStatus::None;
+
+            PersonStatus person = PersonStatus::None;
+            const char* label = "No people detected";
+            float cm = 0, distance = 0;
+            bool updateCameraState = true;
+
+            if (servoMode) {
+                bool heightValid = false;
+                if (people.size() == 1 && framing == FramingStatus::FullBody) {
+                    const auto& box = people.front();
+                    float focal = cfg.focalPx * height;
+                    if (cfg.cameraHeightCm > 0.0f && focal > 0.0f) {
+                        heightValid = groundHeight(box, width, height, focal,
+                            cfg.cameraHeightCm, frameTiltDeg, cm, distance);
+                    } else if (!cfg.groundMode && std::fabs(frameTiltDeg) < 1.0f) {
+                        if (focal == 0.0f && cfg.distanceM > 0 && cfg.referenceCm > 0) {
+                            float medBoxH = 0;
+                            if (calibCollector.add(box.y2 - box.y1, medBoxH)) {
+                                const float calibratedFocal = medBoxH * cfg.distanceM / (cfg.referenceCm / 100.0f);
+                                if (std::isfinite(calibratedFocal) && calibratedFocal > 0.0f) {
+                                    focal = calibratedFocal;
+                                    saveFocalIfUnchanged(cfg, focal / height);
+                                }
                             }
-                        } else {
-                            label = "Hold still to calibrate";
+                        }
+                        if (focal > 0.0f && cfg.distanceM > 0) {
+                            distance = cfg.distanceM;
+                            cm = 100.0f * (box.y2 - box.y1) * distance / focal;
+                            heightValid = std::isfinite(cm) && cm >= 30 && cm <= 250 && distance > 0 && distance <= 20;
                         }
                     }
-                } else {
-                    calibCollector.reset();
                 }
-
-                bool valid = false;
-                if (cfg.groundMode) {
-                    valid = groundHeight(box, width, height, focal,
-                        cfg.cameraHeightCm, cfg.tiltDeg, cm, distance);
-                } else if (focal > 0 && std::fabs(cfg.tiltDeg) < .01f) {
-                    distance = cfg.distanceM;
-                    cm = 100 * (box.y2 - box.y1) * distance / focal;
-                    valid = std::isfinite(cm) && cm >= 30 && cm <= 250 && distance > 0 && distance <= 20;
-                }
-                if (valid) {
-                    person = PersonStatus::Measured;
-                    label = "Full body detected";
+                const bool weightStableNow = scaleSampleSnapshot().measurement.weightStable;
+                servoDecision = stepFsm.onFrame(
+                    makeStepScanConfig(cfg), clockMs(), people.size() > 1,
+                    framing, heightValid, weightStableNow);
+                if (servoDecision.useForHeight && heightValid) {
                     heightFilter.push(cm, distance);
                     heightFilter.median(cm, distance);
                 }
-            }
-        }
+                if (servoDecision.heightFrozen) {
+                    if (!hasFrozenHeight && heightFilter.median(frozenHeightCm, frozenDistanceM)) {
+                        hasFrozenHeight = true;
+                    }
+                    if (hasFrozenHeight) {
+                        cm = frozenHeightCm;
+                        distance = frozenDistanceM;
+                    }
+                }
+                if (stepFsm.phase() == ScanPhase::Sweeping) {
+                    heightFilter.reset();
+                    calibCollector.reset();
+                    hasFrozenHeight = false;
+                    prevLockedPhase = false;
+                }
 
-        xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-        bool publish = s_gate.accepts(token);
+                if (servoDecision.multiplePeople) {
+                    person = PersonStatus::Multiple;
+                    label = "Multiple people";
+                    lcdClearMessage();
+                } else if (servoDecision.tooClose) {
+                    person = PersonStatus::Partial;
+                    label = "Too close - step back";
+                    lcdMessage("Too close!", "Step back!");
+                } else if (servoDecision.sideClipped) {
+                    person = PersonStatus::Partial;
+                    label = "Center on scale";
+                    lcdMessage("Center on scale", "Move to middle");
+                } else if (stepFsm.phase() == ScanPhase::LockedMeasure) {
+                    if (!prevLockedPhase) {
+                        lcdClearMessage();
+                        prevLockedPhase = true;
+                    }
+                    if (hasFrozenHeight || (servoDecision.useForHeight && heightValid)) {
+                        person = PersonStatus::Measured;
+                        label = servoDecision.heightFrozen
+                            ? (servoDecision.weightTimedOut ? "Height locked - stand still" : "Height locked")
+                            : "Full body detected";
+                    } else if (framing == FramingStatus::FullBody && !heightValid) {
+                        person = PersonStatus::NeedsCalibration;
+                        label = "Check calibration (height & fy/H)";
+                    } else {
+                        person = PersonStatus::Partial;
+                        label = "Hold still";
+                    }
+                } else {
+                    person = people.empty() ? PersonStatus::None : PersonStatus::Partial;
+                    if (servoDecision.sweepExhausted) {
+                        label = "Sweep limit - step back";
+                        lcdMessage("Cannot fit body", "Step back!");
+                    } else {
+                        label = "Scanning camera...";
+                        char l1[17];
+                        snprintf(l1, sizeof(l1), "Angle: %.0f deg", frameServoDeg);
+                        lcdMessage("Scanning...", l1);
+                    }
+                }
+                setActivePhaseIfEnabled(scanPhaseName(stepFsm.phase()));
+            } else {
+                if (people.empty()) {
+                    if (hadPerson && ++consecutiveNone < kNoneDebounceFrames) {
+                        // Tolerate 1-2 missed detections without clearing active scale weight/BMI.
+                        label = "No people detected";
+                        updateCameraState = false;
+                    } else {
+                        hadPerson = false;
+                        consecutiveNone = 0;
+                        heightFilter.reset();
+                        calibCollector.reset();
+                    }
+                } else if (people.size() > 1) {
+                    consecutiveNone = 0;
+                    hadPerson = false;
+                    heightFilter.reset();
+                    calibCollector.reset();
+                    person = PersonStatus::Multiple;
+                    label = "Multiple people";
+                } else {
+                    consecutiveNone = 0;
+                    hadPerson = true;
+                    const auto& box = people.front();
+                    person = PersonStatus::Partial;
+                    label = "Show head and feet";
+                    if (!fullBox(box, width, height)) {
+                        calibCollector.reset();
+                    } else {
+                        person = PersonStatus::NeedsCalibration;
+                        label = "Check calibration";
+                        // Store focal in normalized image-height units, so a resolution
+                        // change does not silently invalidate it (viewer calls it fy/H).
+                        float focal = cfg.focalPx * height;
+                        if (!cfg.groundMode && focal == 0 && std::fabs(cfg.tiltDeg) < .01f) {
+                            if (cfg.distanceM > 0 && cfg.referenceCm > 0) {
+                                float medBoxH = 0;
+                                if (calibCollector.add(box.y2 - box.y1, medBoxH)) {
+                                    const float calibratedFocal = medBoxH * cfg.distanceM / (cfg.referenceCm / 100.0f);
+                                    if (std::isfinite(calibratedFocal) && calibratedFocal > 0.0f) {
+                                        focal = calibratedFocal;
+                                        saveFocalIfUnchanged(cfg, focal / height);
+                                    }
+                                } else {
+                                    label = "Hold still to calibrate";
+                                }
+                            }
+                        } else {
+                            calibCollector.reset();
+                        }
+
+                        bool valid = false;
+                        if (cfg.groundMode) {
+                            valid = groundHeight(box, width, height, focal,
+                                cfg.cameraHeightCm, cfg.tiltDeg, cm, distance);
+                        } else if (focal > 0 && std::fabs(cfg.tiltDeg) < .01f) {
+                            distance = cfg.distanceM;
+                            cm = 100 * (box.y2 - box.y1) * distance / focal;
+                            valid = std::isfinite(cm) && cm >= 30 && cm <= 250 && distance > 0 && distance <= 20;
+                        }
+                        if (valid) {
+                            person = PersonStatus::Measured;
+                            label = "Full body detected";
+                            heightFilter.push(cm, distance);
+                            heightFilter.median(cm, distance);
+                        }
+                    }
+                }
+            }
+
+            xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+            bool publish = s_gate.accepts(token);
 #ifndef EDGE_CAMERA_CONTINUOUS
-        const auto currentScale = scaleSampleSnapshot();
-        publish = publish && currentScale.present() &&
-                  currentScale.sessionId == s_requested_scale_session;
+            const auto currentScale = scaleSampleSnapshot();
+            publish = publish && currentScale.present() &&
+                      currentScale.sessionId == s_requested_scale_session;
 #endif
-        if (!publish) {
-            xSemaphoreGive(s_capture_mutex);
-            continue;
-        }
-        MeasurementView view;
-#ifdef EDGE_CAMERA_CONTINUOUS
-        if (updateCameraState) {
-            cameraState(person, cm, distance);
-        }
-        view = stateSnapshot();
-#else
-        if (updateCameraState) {
-            if (!cameraStateForScaleSession(s_requested_scale_session, person, cm, distance, view)) {
+            if (!publish) {
                 xSemaphoreGive(s_capture_mutex);
                 continue;
             }
-        } else {
-            view = stateSnapshot();
-        }
-#endif
-        if (view.hasBMI) {
-            s_last_result = view;
-            s_have_result = true;
-        } else if (person == PersonStatus::Multiple) {
-            s_have_result = false;
-        }
-        xSemaphoreGive(s_capture_mutex);
-
-        size_t boxPos = 0;
-        boxes[boxPos++] = '[';
-        const size_t maxBoxes = std::min<size_t>(people.size(), 20);
-        for (size_t i = 0; i < maxBoxes && boxPos + 2 < kBoxesCapacity; ++i) {
-            const auto& b = people[i];
-            const int written = snprintf(boxes + boxPos, kBoxesCapacity - boxPos - 1,
-                "%s[%.1f,%.1f,%.1f,%.1f,%.3f]", i ? "," : "", b.x1, b.y1, b.x2, b.y2, b.score);
-            if (written < 0 || boxPos + static_cast<size_t>(written) + 2 > kBoxesCapacity) {
-                break;
+            MeasurementView view;
+#ifdef EDGE_CAMERA_CONTINUOUS
+            if (updateCameraState) {
+                cameraState(person, cm, distance);
             }
-            boxPos += static_cast<size_t>(written);
+            view = stateSnapshot();
+#else
+            if (updateCameraState) {
+                if (!cameraStateForScaleSession(s_requested_scale_session, person, cm, distance, view)) {
+                    xSemaphoreGive(s_capture_mutex);
+                    continue;
+                }
+            } else {
+                view = stateSnapshot();
+            }
+#endif
+            if (view.hasBMI) {
+                s_last_result = view;
+                s_have_result = true;
+            } else if (person == PersonStatus::Multiple) {
+                s_have_result = false;
+            }
+            xSemaphoreGive(s_capture_mutex);
+
+            size_t boxPos = 0;
+            boxes[boxPos++] = '[';
+            const size_t maxBoxes = std::min<size_t>(people.size(), 20);
+            for (size_t i = 0; i < maxBoxes && boxPos + 2 < kBoxesCapacity; ++i) {
+                const auto& b = people[i];
+                const int written = snprintf(boxes + boxPos, kBoxesCapacity - boxPos - 1,
+                    "%s[%.1f,%.1f,%.1f,%.1f,%.3f]", i ? "," : "", b.x1, b.y1, b.x2, b.y2, b.score);
+                if (written < 0 || boxPos + static_cast<size_t>(written) + 2 > kBoxesCapacity) {
+                    break;
+                }
+                boxPos += static_cast<size_t>(written);
+            }
+            boxes[boxPos++] = ']';
+            boxes[boxPos] = '\0';
+            char weight[32] = "null", bmi[32] = "null", h[32] = "null", d[32] = "null";
+            if (view.hasWeight) snprintf(weight, sizeof(weight), "%.2f", view.weightKg);
+            if (view.hasBMI) snprintf(bmi, sizeof(bmi), "%.2f", view.bmi);
+            if (view.hasHeight) {
+                snprintf(h, sizeof(h), "%.1f", view.heightCm);
+                snprintf(d, sizeof(d), "%.3f", view.distanceM);
+            }
+            const char* activePhaseStr = s_system_phase.load();
+            char servoDegStr[24] = "null";
+            if (servoMode) {
+                snprintf(servoDegStr, sizeof(servoDegStr), "%.1f", frameServoDeg);
+            }
+            snprintf(metadata, kMetadataCapacity,
+                "{\"kind\":\"frame\",\"width\":%d,\"height\":%d,\"status\":\"%s\",\"boxes\":%s,"
+                "\"height_cm\":%s,\"distance_m\":%s,\"weight_kg\":%s,\"weight_stable\":%s,\"bmi\":%s,\"held\":%s,"
+                "\"processing_ms\":%lu,\"capture_ms\":%lu,\"free_psram\":%u,"
+                "\"free_internal\":%u,\"wifi_rssi\":%d,\"session_id\":%lu,"
+                "\"phase\":\"%s\",\"servo_deg\":%s,\"tilt_deg\":%.1f,"
+                "\"framing\":\"%s\",\"servo_attached\":%s}",
+                width, height, label, boxes, h, d, weight,
+                view.weightStable ? "true" : "false", bmi, view.held ? "true" : "false",
+                static_cast<unsigned long>(clockMs() - inferStarted),
+                static_cast<unsigned long>(captureMs),
+                unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                wifiRssi(),
+                static_cast<unsigned long>(token),
+                activePhaseStr,
+                servoDegStr,
+                frameTiltDeg,
+                framingStatusName(framing),
+                (servoMode && servoIsAttached()) ? "true" : "false");
+            xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+            publish = s_gate.accepts(token);
+            xSemaphoreGive(s_capture_mutex);
+            if (publish) {
+                usbFrame(jpeg, length, metadata);
+            }
         }
-        boxes[boxPos++] = ']';
-        boxes[boxPos] = '\0';
-        char weight[32] = "null", bmi[32] = "null", h[32] = "null", d[32] = "null";
-        if (view.hasWeight) snprintf(weight, sizeof(weight), "%.2f", view.weightKg);
-        if (view.hasBMI) snprintf(bmi, sizeof(bmi), "%.2f", view.bmi);
-        if (view.hasHeight) {
-            snprintf(h, sizeof(h), "%.1f", view.heightCm);
-            snprintf(d, sizeof(d), "%.3f", view.distanceM);
-        }
-        snprintf(metadata, kMetadataCapacity,
-            "{\"kind\":\"frame\",\"width\":%d,\"height\":%d,\"status\":\"%s\",\"boxes\":%s,"
-            "\"height_cm\":%s,\"distance_m\":%s,\"weight_kg\":%s,\"weight_stable\":%s,\"bmi\":%s,\"held\":%s,"
-            "\"processing_ms\":%lu,\"capture_ms\":%lu,\"free_psram\":%u,"
-            "\"free_internal\":%u,\"wifi_rssi\":%d,\"session_id\":%lu}",
-            width, height, label, boxes, h, d, weight,
-            view.weightStable ? "true" : "false", bmi, view.held ? "true" : "false",
-            static_cast<unsigned long>(clockMs() - inferStarted),
-            static_cast<unsigned long>(captureMs),
-            unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-            unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-            wifiRssi(),
-            static_cast<unsigned long>(token));
-        xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-        publish = s_gate.accepts(token);
-        xSemaphoreGive(s_capture_mutex);
-        if (publish) {
-            usbFrame(jpeg, length, metadata);
+
+        if (servoMode) {
+            if (servoDecision.action == StepScanAction::MoveToAngle) {
+                if (executeServoMove(servoDecision.targetDeg, cfg.servoSettleMs, servoDecision.flushFrames)) {
+                    stepFsm.onMoved(servoCurrentDeg());
+                }
+            } else if (servoDecision.action == StepScanAction::DetachServo) {
+                servoDetach();
+                edgeNotifyControl();
+            }
         }
     }
 }

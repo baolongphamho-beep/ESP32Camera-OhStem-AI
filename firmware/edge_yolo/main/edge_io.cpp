@@ -1059,6 +1059,16 @@ void lcdMessage(const char* first, const char* second) {
     xSemaphoreGive(s_lcd_mutex);
 }
 
+void lcdClearMessage() {
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    s_lcd_override_active = false;
+    s_lcd_override_until = 0;
+    xSemaphoreGive(s_lcd_mutex);
+    if (s_lcd_wake_sem) {
+        xSemaphoreGive(s_lcd_wake_sem);
+    }
+}
+
 void lcdSetBacklight(bool on) {
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
     const bool prev = s_lcd_backlight;

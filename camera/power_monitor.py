@@ -1,5 +1,6 @@
 """Read scale/power telemetry over SSV1 without OpenCV or a camera."""
 import argparse
+import math
 import time
 
 from usb_protocol import Parser
@@ -20,7 +21,8 @@ def telemetry_change_key(meta):
     base = tuple(meta.get(k) for k in (
         "phase", "cpu_mhz", "wifi_ps", "wifi_started",
         "light_sleep_enabled", "usb_sleep_blocked", "no_ls_locks",
-        "ble_duty_percent", "weight_stable", "lcd_backlight", "hold_sec"))
+        "ble_duty_percent", "weight_stable", "lcd_backlight", "hold_sec",
+        "servo_deg", "servo_attached"))
     if meta.get("phase") == "RESULT_HOLD":
         return base + (meta.get("height_cm"), meta.get("bmi"))
     return base
@@ -46,8 +48,18 @@ def format_telemetry_line(meta):
         h_text = format_metric(meta.get("height_cm"), "cm", ".1f")
         bmi_text = format_metric(meta.get("bmi"), "", ".2f")
         hold_sec = meta.get("hold_sec")
-        hold_text = f" HOLD={hold_sec}s" if isinstance(hold_sec, int) and not isinstance(hold_sec, bool) else ""
+        hold_text = (
+            f" HOLD={hold_sec}s"
+            if (meta.get("phase") == "RESULT_HOLD"
+                and isinstance(hold_sec, int) and not isinstance(hold_sec, bool))
+            else ""
+        )
         extra = f" H={h_text} BMI={bmi_text}{hold_text}"
+    servo_deg = meta.get("servo_deg")
+    if (servo_deg is not None and not isinstance(servo_deg, bool)
+            and isinstance(servo_deg, (int, float)) and math.isfinite(servo_deg)):
+        attached_tag = "OFF" if meta.get("servo_attached") is False else "ON"
+        extra += f" SRV={servo_deg:.1f}deg({attached_tag})"
     return (
         f"[{meta.get('phase', '?')}] CPU={meta.get('cpu_mhz', '?')}MHz "
         f"BLE={meta.get('ble_duty_percent', '?')}% "

@@ -73,4 +73,5 @@ void setUsbLineHandler(UsbLineHandler handler);
 void usbWriteText(const char* text);
 void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata);
 void lcdMessage(const char* first, const char* second);
+void lcdClearMessage();
 uint32_t clockMs();

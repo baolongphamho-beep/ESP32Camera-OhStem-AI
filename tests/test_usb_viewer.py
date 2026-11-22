@@ -4,7 +4,17 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "camera"))
-from usb_viewer import format_metric, format_timing_line, validate_hold_sec, validate_mac
+from usb_viewer import (
+    format_metric,
+    format_servo_line,
+    format_timing_line,
+    framing_box_color,
+    validate_hold_sec,
+    validate_mac,
+    validate_servo_dir,
+    validate_servo_pin,
+    validate_servo_settle,
+)
 
 
 class USBViewerHelperTests(unittest.TestCase):
@@ -67,6 +77,61 @@ class USBViewerHelperTests(unittest.TestCase):
             format_timing_line({"processing_ms": 450, "wifi_rssi": True}),
             "On-board processing: 450 ms",
         )
+
+    def test_validate_servo_helpers(self):
+        self.assertIsNone(validate_servo_pin(""))
+        self.assertEqual(validate_servo_pin("-1"), -1)
+        self.assertEqual(validate_servo_pin(" 10 "), 10)
+        for bad in ("11", "12", "19", "20", "26", "43", "45", "49", "-2", "abc"):
+            with self.subTest(bad_pin=bad):
+                with self.assertRaises(ValueError):
+                    validate_servo_pin(bad)
+
+        self.assertEqual(validate_servo_dir(""), 1)
+        self.assertEqual(validate_servo_dir("1"), 1)
+        self.assertEqual(validate_servo_dir("+1"), 1)
+        self.assertEqual(validate_servo_dir("-1"), -1)
+        for bad in ("0", "2", "abc"):
+            with self.subTest(bad_dir=bad):
+                with self.assertRaises(ValueError):
+                    validate_servo_dir(bad)
+
+        self.assertEqual(validate_servo_settle(""), 200)
+        self.assertEqual(validate_servo_settle("50"), 50)
+        self.assertEqual(validate_servo_settle("2000"), 2000)
+        for bad in ("49", "2001", "-10", "abc"):
+            with self.subTest(bad_settle=bad):
+                with self.assertRaises(ValueError):
+                    validate_servo_settle(bad)
+
+    def test_format_servo_line_and_framing_box_color(self):
+        self.assertIsNone(format_servo_line({"status": "Full body detected"}))
+        self.assertEqual(
+            format_servo_line({
+                "phase": "SERVO_SWEEP",
+                "servo_deg": 103.0,
+                "tilt_deg": 13.0,
+                "framing": "TOP_CLIPPED",
+                "servo_attached": True,
+            }),
+            "Phase: SERVO_SWEEP | Servo: 103.0 deg (tilt +13.0 deg) | Frame: TOP_CLIPPED",
+        )
+        self.assertEqual(
+            format_servo_line({
+                "phase": "LOCKED_MEASURE",
+                "servo_deg": 95.0,
+                "tilt_deg": 5.0,
+                "framing": "FULL_BODY",
+                "servo_attached": False,
+            }),
+            "Phase: LOCKED_MEASURE | Servo: 95.0 deg [OFF] (tilt +5.0 deg) | Frame: FULL_BODY",
+        )
+        self.assertEqual(framing_box_color("FULL_BODY"), (0, 255, 0))
+        self.assertEqual(framing_box_color("TOO_CLOSE"), (0, 0, 255))
+        self.assertEqual(framing_box_color("TOP_CLIPPED"), (0, 165, 255))
+        self.assertEqual(framing_box_color("BOTTOM_CLIPPED"), (0, 165, 255))
+        self.assertEqual(framing_box_color("SIDE_CLIPPED"), (0, 165, 255))
+        self.assertEqual(framing_box_color(None), (0, 255, 0))
 
 
 if __name__ == "__main__":

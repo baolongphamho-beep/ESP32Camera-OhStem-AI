@@ -19,6 +19,15 @@ class USBProtocolTests(unittest.TestCase):
         self.assertTrue(sessions.accept({"kind": "frame", "session_id": 3}))
         self.assertFalse(sessions.accept({"kind": "scale", "session_id": 2, "phase": "STANDBY"}))
 
+    def test_session_filter_accepts_phase3_scan_phases_and_rejects_sleep_phases(self):
+        sessions = SessionFilter()
+        for active_phase, sid in (("WAKING_HOMING", 10), ("SERVO_SWEEP", 11), ("LOCKED_MEASURE", 12)):
+            self.assertTrue(sessions.accept({"kind": "scale", "session_id": sid, "phase": active_phase}))
+            self.assertTrue(sessions.accept({"kind": "frame", "session_id": sid}))
+        for sleep_phase, sid in (("DRAINING", 13), ("RESULT_HOLD", 14), ("STANDBY", 15)):
+            self.assertTrue(sessions.accept({"kind": "scale", "session_id": sid, "phase": sleep_phase}))
+            self.assertFalse(sessions.accept({"kind": "frame", "session_id": sid}))
+
     def test_session_filter_handles_generation_rollover(self):
         sessions = SessionFilter()
         self.assertTrue(sessions.accept({"kind": "frame", "session_id": 0xffffffff}))

@@ -69,6 +69,36 @@ class PowerMonitorTests(unittest.TestCase):
         self.assertIn("[RESULT_HOLD] CPU=80MHz BLE=10.0%", hold_line)
         self.assertIn("LCD=ON H=172.0 cm BMI=22.11 HOLD=10s |", hold_line)
 
+    def test_servo_sweep_and_locked_measure_telemetry(self):
+        sweep_a = {
+            "phase": "SERVO_SWEEP",
+            "cpu_mhz": 240,
+            "ble_duty_percent": 12.5,
+            "weight_kg": 65.4,
+            "weight_stable": False,
+            "lcd_backlight": True,
+            "wifi_ps": "NONE",
+            "wifi_started": True,
+            "light_sleep_enabled": True,
+            "usb_sleep_blocked": True,
+            "no_ls_locks": 2,
+            "hold_sec": 10,
+            "servo_deg": 107.5,
+            "servo_attached": True,
+        }
+        sweep_b = dict(sweep_a, servo_deg=103.0)
+        locked = dict(sweep_b, phase="LOCKED_MEASURE", servo_attached=False, height_cm=170.0, bmi=22.63)
+        self.assertNotEqual(telemetry_change_key(sweep_a), telemetry_change_key(sweep_b))
+        self.assertNotEqual(telemetry_change_key(sweep_b), telemetry_change_key(locked))
+
+        sweep_line = format_telemetry_line(sweep_a)
+        self.assertIn("[SERVO_SWEEP] CPU=240MHz BLE=12.5%", sweep_line)
+        self.assertIn("LCD=ON SRV=107.5deg(ON) |", sweep_line)
+
+        locked_line = format_telemetry_line(locked)
+        self.assertIn("[LOCKED_MEASURE]", locked_line)
+        self.assertIn("H=170.0 cm BMI=22.63 SRV=103.0deg(OFF) |", locked_line)
+
 
 if __name__ == "__main__":
     unittest.main()
