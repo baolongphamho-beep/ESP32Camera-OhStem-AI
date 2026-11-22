@@ -6,6 +6,7 @@ import threading
 import time
 import zlib
 
+from serial_port import add_port_argument, port_or_exit
 from usb_protocol import HEADER, MAGIC, MAX_JPEG, MAX_JSON, config_commands
 
 
@@ -185,13 +186,14 @@ def _pump_serial(port, demux, stop_event, print_lock):
 def main():
     import serial
     args_parser = argparse.ArgumentParser(description=__doc__)
-    args_parser.add_argument("--port", required=True, help="COM port of YOLO UNO (e.g. COM16)")
+    add_port_argument(args_parser)  # TV5: default auto-detect (or e.g. --port COM16)
     args_parser.add_argument("--cmd", help="Run a single command and exit (e.g. 'SERVO STATUS')")
     args_parser.add_argument("--timeout", type=float, default=1.5,
                              help="Seconds to collect output in --cmd mode (default: 1.5)")
     args = args_parser.parse_args()
     if args.timeout <= 0:
         args_parser.error("--timeout must be positive")
+    args.port = port_or_exit(args.port)
 
     demux = StreamDemux()
     stop_event = threading.Event()

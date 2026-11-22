@@ -4,7 +4,8 @@ import math
 import re
 import time
 
-from usb_protocol import Parser, SessionFilter, config_commands
+from serial_port import add_port_argument, port_or_exit
+from usb_protocol import CONFIG_QUERY, Parser, SessionFilter, config_commands, config_set_args, format_config
 
 _MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
 _RESERVED_SERVO_PINS = {11, 12, 19, 20, 43, 44, 45, 46} | set(range(22, 38))
@@ -289,11 +290,45 @@ def configure():
     return config_commands(values)
 
 
+def read_config(port, timeout=4.0, clock=time.monotonic):
+    """TV5: send CONFIG? and return the config_values packet (None on timeout)."""
+    decoder = Parser()
+    port.write(CONFIG_QUERY)
+    end = clock() + timeout
+    while clock() < end:
+        for metadata, _ in decoder.feed(port.read(min(max(port.in_waiting, 1), 65536))):
+            if metadata.get("kind") == "config_values":
+                return metadata
+    return None
+
+
+def show_config(name):
+    """TV5: --show-config prints the configuration in use (no window, no password)."""
+    with open_device(name) as port:
+        print(f"Da mo {name}.", flush=True)
+        meta = read_config(port)
+    if meta is None:
+        print("UNO khong tra loi CONFIG? (firmware chua co lenh nay, hoac ban -ServoTest/khac).")
+        return 1
+    print("Cau hinh dang dung tren UNO:")
+    for line in format_config(meta):
+        print(line)
+    backup = config_set_args(meta)
+    if backup:
+        print(f"Sao luu hieu chuan (gui lai bang --configure neu can nap lai bo): {backup}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", required=True, help="Vi du COM9")
+    add_port_argument(parser)  # TV5: default "auto" finds the YOLO UNO (USB Espressif 303A)
     parser.add_argument("--configure", action="store_true", help="Nhap WiFi va thong so lap dat")
+    parser.add_argument("--show-config", action="store_true",
+                        help="Doc lai cau hinh dang luu tren UNO (CONFIG?), khong mo cua so")
     args = parser.parse_args()
+    args.port = port_or_exit(args.port)
+    if args.show_config:
+        return show_config(args.port)
     import cv2
     import numpy as np
     import serial

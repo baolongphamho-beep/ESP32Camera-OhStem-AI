@@ -1,4 +1,5 @@
 #include "edge_io.h"
+#include "config_readback.h"
 #include "ble_scan_retry.h"
 #include "wifi_reconnect.h"
 #include "wifi_credentials.h"
@@ -709,6 +710,14 @@ void usbWriteText(const char* text) {
 }
 
 static void processConfigLine(const std::string& line) {
+    if (line == "CONFIG?") {
+        // TV5: read back the configuration in use (NVS after boot/APPLY); never the password.
+        char json[768];
+        const EdgeConfig cfg = configSnapshot();
+        if (config_readback::toJson(cfg, json, sizeof(json))) usbFrame(nullptr, 0, json);
+        else usbFrame(nullptr, 0, "{\"kind\":\"config_values\",\"error\":\"too long\"}");
+        return;
+    }
     if (line == "BEGIN") {
         s_staging_config = configSnapshot();
         s_in_config_session = true;

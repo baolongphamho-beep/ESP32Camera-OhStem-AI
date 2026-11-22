@@ -1,5 +1,7 @@
 # SmartScale — Hệ Thống Đo Nhân Trắc Tự Động (AI + Cân BLE + LCD)
 
+> **Nhánh TV5 (`feat/ui-viewer-qa`) — UI/LCD, USB viewer/config, QA & tài liệu:** dựa trên `smartscale-edge-ai@4ce7f4e`, giữ nguyên FSM Step-Scan và firmware của nhánh chính; thêm lệnh USB `CONFIG?` (đọc lại cấu hình), kiểm tra chữ LCD ≤ 16 ký tự, tự tìm cổng COM, `--show-config`, công cụ đo camera/độ trễ ảnh, bảng sai số chiều cao và hướng dẫn nghiệm thu. Xem [docs/TV5_GUIDE.md](docs/TV5_GUIDE.md).
+
 > [!TIP]
 > 📖 **Dành cho người mới bắt đầu hoặc thiết lập trên laptop mới:**  
 > Vui lòng xem tài liệu hướng dẫn từng bước chi tiết tại: [**docs/SETUP_GUIDE_NEW_LAPTOP.md**](docs/SETUP_GUIDE_NEW_LAPTOP.md).  
@@ -177,4 +179,15 @@ Khi terminal hiện **`Da luu cau hinh.`**, toàn bộ thông số đã được
 ### Kiểm thử đơn vị (Unit Tests)
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+---
+
+## 5. Nhánh TV5 (`feat/ui-viewer-qa`)
+
+Hiệu chuẩn servo, đọc lại cấu hình, đo camera và nghiệm thu: [docs/TV5_GUIDE.md](docs/TV5_GUIDE.md).
+
+```powershell
+python camera/usb_viewer.py --show-config     # cấu hình đang lưu trên UNO (cổng COM tự tìm)
+python tools/run_tv5_tests.py                 # toàn bộ test Python + C++ của nhánh
 ```

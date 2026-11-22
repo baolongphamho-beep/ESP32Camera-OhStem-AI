@@ -125,3 +125,62 @@ def config_commands(values):
             raise ValueError(f"{key} is too long")
         commands.append(f"CFG {key}={text}")
     return ("\n".join(commands + ["APPLY", ""]).encode())
+
+
+# ---- TV5: read back the configuration stored on the UNO (USB "CONFIG?") ----------
+CONFIG_QUERY = b"CONFIG?\n"
+CONFIG_LABELS = [
+    ("ssid", "Wi-Fi SSID"),
+    ("password_set", "Da co mat khau Wi-Fi"),
+    ("camera", "URL camera"),
+    ("mac", "MAC can"),
+    ("mode", "Che do do (fixed/ground)"),
+    ("distance", "Khoang cach camera - nguoi (m)"),
+    ("reference", "Chieu cao nguoi chuan (cm)"),
+    ("focal", "fy/H"),
+    ("height", "Camera cao hon mat can (cm)"),
+    ("tilt", "Goc nghieng co dinh (do)"),
+    ("hold_sec", "Giu ket qua (s)"),
+    ("servo_pin", "Chan servo (GPIO)"),
+    ("servo_min", "Gioi han duoi servo (do)"),
+    ("servo_max", "Gioi han tren servo (do)"),
+    ("servo_bottom", "Bat dau quet (camera nhin thap)"),
+    ("servo_top", "Ket thuc quet (camera nhin cao)"),
+    ("servo_step", "Buoc quet (do)"),
+    ("servo_level", "Goc servo khi camera nam ngang"),
+    ("servo_dir", "Chieu quay"),
+    ("servo_settle", "Cho sau moi lan quay (ms)"),
+    ("revision", "So lan APPLY tu khi bat"),
+]
+
+
+def format_config(meta):
+    """Lines for a {"kind":"config_values"} reply (the firmware never sends the password)."""
+    if not isinstance(meta, dict) or meta.get("kind") != "config_values":
+        return ["Khong phai goi cau hinh."]
+    if meta.get("error"):
+        return [f"UNO bao loi: {meta['error']}"]
+    lines = []
+    for key, label in CONFIG_LABELS:
+        if key not in meta:
+            continue
+        value = meta[key]
+        if key == "servo_dir" and value in (-1, 1):
+            value = f"{value} ({'tang goc -> camera CUI XUONG' if value == 1 else 'tang goc -> camera NGANG LEN'})"
+        elif key == "password_set":
+            value = "co" if value is True else "chua"
+        elif isinstance(value, float):
+            value = f"{value:g}"
+        lines.append(f"  {label:<36} {key} = {value}")
+    return lines or ["Goi cau hinh rong."]
+
+
+def config_set_args(meta, keys=("servo_level", "servo_dir", "servo_bottom", "servo_top",
+                                "servo_min", "servo_max", "height", "focal")):
+    """'--set key=value ...' text to re-apply a calibration (no Wi-Fi password)."""
+    parts = []
+    for key in keys:
+        if key in meta and meta[key] is not None:
+            value = meta[key]
+            parts.append(f"{key}={value:g}" if isinstance(value, float) else f"{key}={value}")
+    return " ".join(parts)

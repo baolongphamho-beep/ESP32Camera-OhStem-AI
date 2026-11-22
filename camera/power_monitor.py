@@ -3,6 +3,7 @@ import argparse
 import math
 import time
 
+from serial_port import add_port_argument, port_or_exit
 from usb_protocol import Parser
 from usb_viewer import format_metric
 
@@ -74,12 +75,13 @@ def main():
     import serial
 
     args_parser = argparse.ArgumentParser(description=__doc__)
-    args_parser.add_argument("--port", required=True)
+    add_port_argument(args_parser)  # TV5: default auto-detect
     args_parser.add_argument("--seconds", type=float, default=0,
                              help="stop after N seconds; 0 means until Ctrl+C")
     args = args_parser.parse_args()
     if args.seconds < 0:
         args_parser.error("--seconds must be nonnegative")
+    args.port = port_or_exit(args.port)
 
     parser = Parser()
     previous = None

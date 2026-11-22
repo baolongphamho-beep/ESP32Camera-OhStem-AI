@@ -1279,7 +1279,7 @@ extern "C" void app_main() {
     for (const auto& input : model->get_inputs()) {
         if (!input.second || !input.second->data) {
             heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
-            lcdMessage("Model input error", "Check USB viewer");
+            lcdMessage("Model input err", "Check USB viewer");  // TV5: max 16 chars on the 16x2 LCD
             while (true) { status("Model input allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); }
         }
         memset(input.second->data, 0, input.second->get_bytes());
