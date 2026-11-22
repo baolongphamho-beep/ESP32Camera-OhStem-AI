@@ -1,7 +1,10 @@
 # Báo Cáo Rà Soát Toàn Bộ Dự Án — `NimBLE_SmartScale_Cp`
 
-> **Phạm vi kiểm tra:** Toàn bộ mã nguồn C++ (ESP-IDF `firmware/edge_yolo/`, Arduino/PlatformIO `src/` & `lib/`), công cụ Python & PowerShell (`camera/`, `tools/`), cấu hình build (`sdkconfig*`, `platformio.ini`, `boards/`), unit tests (`tests/`) và tài liệu (`docs/`, `README.md`).  
-> **Trạng thái kiểm thử tự động hiện tại:** 15/15 Python unit tests và 3/3 C++ unit tests đều **PASS** (`measurement_state_test`, `edge_geometry_test`, `display_probe_test`).
+> [!NOTE]
+> **Cập nhật trạng thái (sau commit `5533edb` & hoàn thiện Phase 1 + Phase 2):** Toàn bộ các lỗi Critical/High và các mục tối ưu ưu tiên 1–2 của **Pipeline 1 (`firmware/edge_yolo/`)** trong báo cáo này (song song hóa Core 0/Core 1, tick `1000 Hz`, LCD resync không busy-wait, I2C pull-up & cache dòng LCD, tắt đèn nền LCD ở `STANDBY`, Wi-Fi reconnect dùng `esp_timer`, BLE lọc MAC + `BleScanRetry` + mặc định standby `10%`, đồng bộ `hold_sec` mặc định `10s`, `HeightMedianFilter`, `AutoCalibCollector`, event-driven sleep kể cả trong `lcdTask`, RAII `CaptureLease`, tối ưu Internal SRAM khi boot bằng cách đẩy `dl::Model`/`HttpCaptureClient`/buffer JSON sang PSRAM và đặt `ALWAYSINTERNAL=512`, driver Servo LEDC 50 Hz 14-bit dùng `ledc_set_duty`/`ledc_update_duty`, `analyzeFraming()`, ROM CRC32, `usb_viewer.py`, `power_monitor.py`, `servo_bench.py` & `quantize.py`) **đã được xử lý xong**. Các mục thuộc **Pipeline 2 cũ** (`src/`, `lib/BLE/`, `lib/Scale/`, `lib/calib_fsm/`, `boards/`, `camera/start_smartscale.ps1`) được giữ nguyên theo phạm vi dự án để không ảnh hưởng nhánh di sản.
+
+> **Phạm vi kiểm tra ban đầu:** Toàn bộ mã nguồn C++ (ESP-IDF `firmware/edge_yolo/`, Arduino/PlatformIO `src/` & `lib/`), công cụ Python & PowerShell (`camera/`, `tools/`), cấu hình build (`sdkconfig*`, `platformio.ini`, `boards/`), unit tests (`tests/`) và tài liệu (`docs/`, `README.md`).  
+> **Trạng thái kiểm thử tự động hiện tại:** Kiểm tra lệnh thực tế tại [CAMERA_POWER_INTEGRATION.md](./CAMERA_POWER_INTEGRATION.md) (29 Python unit tests & 11 C++ host unit tests đều PASS).
 
 ---
 

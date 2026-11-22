@@ -2,8 +2,30 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 struct PersonBox { float x1, y1, x2, y2, score; };
+
+enum class FramingStatus {
+    None,
+    FullBody,
+    TopClipped,
+    BottomClipped,
+    TooClose,
+    SideClipped,
+};
+
+inline const char* framingStatusName(FramingStatus status) {
+    switch (status) {
+        case FramingStatus::None: return "NONE";
+        case FramingStatus::FullBody: return "FULL_BODY";
+        case FramingStatus::TopClipped: return "TOP_CLIPPED";
+        case FramingStatus::BottomClipped: return "BOTTOM_CLIPPED";
+        case FramingStatus::TooClose: return "TOO_CLOSE";
+        case FramingStatus::SideClipped: return "SIDE_CLIPPED";
+    }
+    return "NONE";
+}
 
 // Match ESP-DL ImagePreprocessor's integer letterbox borders exactly.
 inline PersonBox originalBox(PersonBox b, int width, int height, int input = 224) {
@@ -25,6 +47,38 @@ inline bool fullBox(const PersonBox& b, int width, int height) {
            b.x2 > b.x1 && b.y2 - b.y1 >= height * .2f;
 }
 
+inline FramingStatus analyzeFraming(const PersonBox& box,
+                                    int width,
+                                    int height,
+                                    float marginPx = 8.0f,
+                                    float minHeightRatio = 0.20f) {
+    if (width <= 0 || height <= 0 || !std::isfinite(marginPx) || marginPx < 0.0f ||
+        !std::isfinite(minHeightRatio) || minHeightRatio < 0.0f) {
+        return FramingStatus::None;
+    }
+    if (!std::isfinite(box.x1) || !std::isfinite(box.y1) ||
+        !std::isfinite(box.x2) || !std::isfinite(box.y2)) {
+        return FramingStatus::None;
+    }
+    const float bw = box.x2 - box.x1;
+    const float bh = box.y2 - box.y1;
+    if (bw < 2.0f || bh < 2.0f) {
+        return FramingStatus::None;
+    }
+    const bool topClipped = (box.y1 <= marginPx);
+    const bool bottomClipped = (box.y2 >= static_cast<float>(height) - marginPx);
+    const bool sideClipped = (box.x1 <= marginPx) || (box.x2 >= static_cast<float>(width) - marginPx);
+    if (topClipped && bottomClipped) return FramingStatus::TooClose;
+    if (topClipped) return FramingStatus::TopClipped;
+    if (bottomClipped) return FramingStatus::BottomClipped;
+    if (sideClipped) return FramingStatus::SideClipped;
+    if (bh < static_cast<float>(height) * minHeightRatio) {
+        return FramingStatus::None;
+    }
+    return FramingStatus::FullBody;
+}
+
+// focal is pixel focal length (cfg.focalPx * height), NOT normalized fy/H.
 inline bool groundHeight(const PersonBox& b, int width, int height, float focal,
                          float cameraCm, float tiltDeg, float& cm, float& distance) {
     if (focal <= 0 || cameraCm <= 0 || std::fabs(tiltDeg) >= 80) return false;
@@ -41,6 +95,28 @@ inline bool groundHeight(const PersonBox& b, int width, int height, float focal,
     distance = std::hypot(z, x);
     return std::isfinite(cm) && cm >= 30 && cm <= 250 &&
            std::isfinite(distance) && distance > 0 && distance <= 20;
+}
+
+// focal is pixel focal length (cfg.focalPx * height), NOT normalized fy/H.
+// outTiltDeg is intentionally unclamped so groundHeight() rejects |tilt| >= 80 deg.
+inline bool groundHeightAtServo(const PersonBox& b,
+                                int width,
+                                int height,
+                                float focal,
+                                float cameraCm,
+                                float servoDeg,
+                                float servoLevelDeg,
+                                int8_t servoDir,
+                                float tiltOffsetDeg,
+                                float& cm,
+                                float& distance,
+                                float& outTiltDeg) {
+    if (!std::isfinite(servoDeg) || !std::isfinite(servoLevelDeg) || !std::isfinite(tiltOffsetDeg)) {
+        return false;
+    }
+    const float sign = (servoDir >= 0) ? 1.0f : -1.0f;
+    outTiltDeg = tiltOffsetDeg + sign * (servoDeg - servoLevelDeg);
+    return groundHeight(b, width, height, focal, cameraCm, outTiltDeg, cm, distance);
 }
 
 class HeightMedianFilter {

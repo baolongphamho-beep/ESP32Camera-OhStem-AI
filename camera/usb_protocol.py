@@ -99,9 +99,24 @@ class Parser:
 
 def config_commands(values):
     commands = ["BEGIN"]
-    limits = {"ssid": 32, "password": 64, "camera": 159, "mac": 17}
+    limits = {
+        "ssid": 32,
+        "password": 64,
+        "camera": 159,
+        "mac": 17,
+        "hold_sec": 3,
+        "servo_pin": 4,
+        "servo_dir": 2,
+        "servo_settle": 4,
+    }
+    allowed_keys = {
+        "ssid", "password", "camera", "mac", "mode", "distance",
+        "reference", "focal", "height", "tilt", "hold_sec",
+        "servo_pin", "servo_min", "servo_max", "servo_bottom",
+        "servo_top", "servo_step", "servo_level", "servo_dir", "servo_settle",
+    }
     for key, value in values.items():
-        if key not in {"ssid", "password", "camera", "mac", "mode", "distance", "reference", "focal", "height", "tilt"}:
+        if key not in allowed_keys:
             raise ValueError("Unknown configuration key")
         text = str(value)
         if "\r" in text or "\n" in text or "\x00" in text:

@@ -5,11 +5,13 @@ param(
     [switch]$Flash,
     [switch]$ScaleOnly,
     [switch]$CameraContinuous,
+    [switch]$ServoTest,
     [ValidateSet(10, 25, 50, 100)]
-    [int]$StandbyScanPercent = 100
+    [int]$StandbyScanPercent = 10
 )
 $ErrorActionPreference = 'Stop'
-if ($ScaleOnly -and $CameraContinuous) { throw 'Choose either -ScaleOnly or -CameraContinuous.' }
+$modeCount = @($ScaleOnly, $CameraContinuous, $ServoTest) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+if ($modeCount -gt 1) { throw 'Choose at most one of -ScaleOnly, -CameraContinuous, or -ServoTest.' }
 
 # Auto-detect Espressif root if not explicitly provided
 if (!$EspressifRoot) {
@@ -127,7 +129,9 @@ try {
             'CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y',
             'CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y',
             'CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y',
-            'CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096',
+            'CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512',
+            'CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240',
+            'CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32',
             'CONFIG_ESP_WIFI_RX_BA_WIN=10',
             'CONFIG_LWIP_SO_LINGER=y',
             'CONFIG_LWIP_MAX_ACTIVE_TCP=32',
@@ -169,7 +173,8 @@ try {
 
     $scaleOnlyValue = if ($ScaleOnly) { 'ON' } else { 'OFF' }
     $continuousValue = if ($CameraContinuous) { 'ON' } else { 'OFF' }
-    idf.py -D IDF_TARGET=esp32s3 -D "SMARTSCALE_SCALE_ONLY=$scaleOnlyValue" -D "SMARTSCALE_CAMERA_CONTINUOUS=$continuousValue" -D "SMARTSCALE_STANDBY_SCAN_PERCENT=$StandbyScanPercent" build
+    $servoTestValue = if ($ServoTest) { 'ON' } else { 'OFF' }
+    idf.py -D IDF_TARGET=esp32s3 -D "SMARTSCALE_SCALE_ONLY=$scaleOnlyValue" -D "SMARTSCALE_CAMERA_CONTINUOUS=$continuousValue" -D "SMARTSCALE_SERVO_TEST=$servoTestValue" -D "SMARTSCALE_STANDBY_SCAN_PERCENT=$StandbyScanPercent" build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if ($Flash) {
         if (!$Port) { throw 'Specify -Port COMx to flash the YOLO UNO (e.g. -Port COM9).' }

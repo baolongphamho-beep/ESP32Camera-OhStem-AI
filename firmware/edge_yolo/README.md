@@ -34,20 +34,23 @@ Không chạy `camera/smartscale_camera.py` hoặc launcher cũ trong chế đ�
 
 Đã chuẩn bị model `models/yolo26n_224_s8_s3.espdl` (~3.08 MB), ESP-DL pinned revision `512ed0b0dc5f5320f3d9ca5a5aea189803f87f31`, cùng môi trường ESP-IDF 5.5.x (đã kiểm tra trên `v5.5.6`) chạy song song 2 nhân (Core 0: Wi-Fi HTTP `/capture` với `Connection: close` cho web server đơn kết nối của OhStem, BLE, USB, LCD; Core 1: `app_main` chạy suy luận YOLO26n).
 
-Từ thư mục gốc project (3 chế độ build):
+Từ thư mục gốc project (4 chế độ build):
 
 ```powershell
-# 1. Chế độ tích hợp mặc định (bước lên cân > 5 kg mới đánh thức camera & AI; bước xuống tự về STANDBY 80 MHz):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -StandbyScanPercent 10 -Flash -Port COM13
+# 1. Chế độ tích hợp mặc định (bước lên cân > 5 kg mới đánh thức camera & AI; bước xuống tự về STANDBY 80 MHz, BLE 10%, LCD OFF):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM16
 
 # 2. Chế độ Camera + AI + cân chạy liên tục (dùng khi test/hiệu chuẩn camera mà chưa bước lên cân):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -CameraContinuous -Flash -Port COM13
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -CameraContinuous -Flash -Port COM16
 
 # 3. Chế độ chỉ test cân BLE + LCD + Power telemetry (không chạy camera/AI):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -StandbyScanPercent 10 -Flash -Port COM13
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -Flash -Port COM16
+
+# 4. Chế độ test độc lập trục Servo PWM trên bàn lab (nhận lệnh USB Serial: SERVO <deg>, SERVO SWEEP, SERVO DETACH):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ServoTest -Flash -Port COM16
 ```
 
-Có thể bỏ `-Flash -Port COM13` nếu chỉ muốn biên dịch kiểm tra. Để theo dõi riêng trạng thái nguồn/CPU/BLE (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM13`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
+Có thể bỏ `-Flash -Port COM16` nếu chỉ muốn biên dịch kiểm tra (mặc định `-StandbyScanPercent 10`, có thể truyền `25`, `50`, `100` nếu muốn đo riêng). Với `-ServoTest`, chạy `python camera/servo_bench.py --port COM16` (hoặc dùng venv `D:\PROJECT\.venv\Scripts\python.exe`) và gửi `help`, `90`, `sweep`, `detach`, `set servo_level=92 servo_dir=-1` để căn góc ngang và kiểm tra sụt áp trước khi ghép FSM ở Phase 3. Để theo dõi riêng trạng thái nguồn/CPU/BLE/LCD (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM16`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
 
 Lệnh thứ hai thay chương trình trên UNO bằng firmware này, có ghi bootloader/bảng phân vùng mới. Script không tự xóa NVS. Firmware Arduino/PlatformIO vẫn nằm nguyên trong project và có thể nạp lại bằng environment cũ.
 
@@ -63,7 +66,7 @@ Các file sau biên dịch ở `build/`: `smartscale_edge_yolo.bin`, `bootloader
 .\.venv-camera\Scripts\python.exe camera/usb_viewer.py --port COM9 --configure
 ```
 
-Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập; bỏ trống nếu mạng Wi-Fi mở), URL ảnh thật của camera như `http://10.127.7.68/capture`, MAC cân Mi Scale 2 (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` nếu muốn tắt lọc MAC) và thông số lắp đặt. Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP.
+Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập; bỏ trống nếu mạng Wi-Fi mở), URL ảnh thật của camera như `http://10.127.7.68/capture`, MAC cân Mi Scale 2 (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` nếu muốn tắt lọc MAC), thông số lắp đặt và thời gian giữ kết quả trên LCD (`hold_sec`: mặc định **`10` giây**, dải `0..60`, `0 = tắt`). Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP. Khi chạy, firmware tự động cấu hình camera về `QVGA (320×240)` và giữ đèn nền LCD tắt ở `STANDBY`, bật sáng khi `ACTIVE` / `RESULT_HOLD`.
 
 - **fixed**: camera đặt ngang, biết khoảng cách tới vị trí đứng. Nhập khoảng cách (m), chiều cao thật người chuẩn (cm). Nhập `fy/H = 0` để hiệu chuẩn tự động khi có **3 frame toàn thân liên tiếp ổn định** (độ lệch chiều cao box ≤ 5%). Người đầu tiên đứng yên trong khung phải chính là người chuẩn, đứng thẳng và thấy cả đỉnh đầu lẫn bàn chân. Sau đó UNO lưu tiêu cự vào NVS để đo người tiếp theo ở cùng vị trí.
 - **ground**: nhập độ cao tâm camera tính từ **mặt trên bàn cân**, góc nghiêng xuống (độ) và `fy/H` đã hiệu chuẩn. Khoảng cách được tính từ tia chiếu chân cắt mặt phẳng bàn cân. `fy/H` bắt buộc khác 0.
@@ -83,7 +86,7 @@ Nhấn Q hoặc Esc để đóng. Laptop không tải/chạy model. Sau cấu h�
 - Không có người: hai dòng `No people` / `detected`.
 - Một người đủ khung và có hiệu chuẩn: dùng bộ lọc trung vị 5 khung hình cho chiều cao/khoảng cách, luân phiên `H:...cm`, `W:...kg LOCK` với `D:...m`, `BMI:...`.
 - Cân chưa chốt: W vẫn cập nhật 2 chữ số thập phân, có `...`; BMI đợi bit ổn định của cân. Khi thiếu khung/chưa hiệu chuẩn (`Partial` / `NeedsCalibration`), LCD vẫn luân phiên hiển thị cân nặng `W:...`.
-- Giữ kết quả (`ResultHold`): sau khi chốt đủ H + W `LOCK` + BMI, khi người dùng bước xuống khỏi cân (`load_removed`) hoặc rời khung hình, kết quả tiếp tục được giữ thêm **12 giây** (`D:...m HOLD` / `BMI:...`) để kịp đọc màn hình LCD (tự xóa sớm nếu có người mới đứng lên cân hoặc có nhiều người).
+- Giữ kết quả (`ResultHold`): sau khi chốt đủ H + W `LOCK` + BMI, khi người dùng bước xuống khỏi cân (`load_removed`) hoặc rời khung hình, kết quả tiếp tục được giữ nguyên trên LCD sáng liền mạch thêm **`10` giây** mặc định (cấu hình `0..60s` qua `hold_sec`: `D:...m HOLD` / `BMI:...`) trước khi tắt đèn nền về `STANDBY` (tự xóa sớm nếu có người mới đứng lên cân hoặc có nhiều người).
 - Nhiều người: yêu cầu một người mỗi lần. Box chạm biên ảnh bị từ chối vì có thể thiếu đầu/chân. Rớt 1–2 khung hình YOLO thoáng qua không làm xóa cân nặng đang đo.
 - Wi-Fi/camera mất kết nối quá 3 lần thử: LCD báo lỗi kết nối thay vì giữ số đo trước.
 - Dữ liệu camera hết hạn sau 10 giây, cân sau 30 giây. BMI chỉ có khi chiều cao mới hợp lệ và cân đã chốt. USB viewer không giữ ảnh cũ khi có thông báo camera offline.

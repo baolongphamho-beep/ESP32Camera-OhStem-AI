@@ -1,5 +1,6 @@
 #include "../firmware/edge_yolo/main/edge_geometry.h"
 #include <cassert>
+#include <string>
 
 int main() {
     // 640x480 is letterboxed to 224x168, with 28px top padding.
@@ -51,4 +52,48 @@ int main() {
     assert(std::fabs(medBoxH - 301.0f) < .001f);
     calib.reset();
     assert(calib.count() == 0);
+
+    // analyzeFraming(): margin=8px on 320x240 QVGA, minHeightRatio=0.20.
+    assert(analyzeFraming({60, 20, 140, 210, .9f}, 320, 240) == FramingStatus::FullBody);
+    assert(analyzeFraming({60, 8, 140, 210, .9f}, 320, 240) == FramingStatus::TopClipped);
+    assert(analyzeFraming({60, 20, 140, 232, .9f}, 320, 240) == FramingStatus::BottomClipped);
+    assert(analyzeFraming({60, 5, 140, 235, .9f}, 320, 240) == FramingStatus::TooClose);
+    assert(analyzeFraming({8, 20, 140, 210, .9f}, 320, 240) == FramingStatus::SideClipped);
+    assert(analyzeFraming({60, 20, 315, 210, .9f}, 320, 240) == FramingStatus::SideClipped);
+    // Priority: TooClose > Top/Bottom > Side; small edge peek stays clipped, unclipped tiny box -> None.
+    assert(analyzeFraming({2, 2, 318, 238, .9f}, 320, 240) == FramingStatus::TooClose);
+    assert(analyzeFraming({2, 4, 140, 210, .9f}, 320, 240) == FramingStatus::TopClipped);
+    assert(analyzeFraming({2, 20, 140, 236, .9f}, 320, 240) == FramingStatus::BottomClipped);
+    assert(analyzeFraming({100, 2, 160, 30, .9f}, 320, 240) == FramingStatus::TopClipped);
+    assert(analyzeFraming({100, 100, 150, 140, .9f}, 320, 240) == FramingStatus::None); // height 40 < 48 (20%)
+    assert(analyzeFraming({100, 100, 101, 180, .9f}, 320, 240) == FramingStatus::None); // width < 2 px
+    assert(std::string(framingStatusName(FramingStatus::TooClose)) == "TOO_CLOSE");
+
+    // groundHeightAtServo(): recover exact physical height & distance across multiple tilt angles.
+    const int w = 320, h = 240;
+    const float focal = 320.0f, camH = 105.0f, trueH = 170.0f, trueZ = 3.50f;
+    const float cy = (h - 1) / 2.0f;
+    const float feetWorldAngle = std::atan2(-(camH / 100.0f), trueZ);
+    const float headWorldAngle = std::atan2((trueH - camH) / 100.0f, trueZ);
+    struct ServoCase { float servoDeg; float levelDeg; int8_t dir; float offsetDeg; float expectedTilt; };
+    const ServoCase cases[] = {
+        {85.0f, 90.0f, -1, 0.0f, 5.0f},   // +5 deg tilt down
+        {90.0f, 90.0f, -1, 0.0f, 0.0f},   // level
+        {92.0f, 90.0f, -1, 0.0f, -2.0f},  // -2 deg tilt up
+        {95.0f, 90.0f, 1, 0.0f, 5.0f},    // reversed servo direction (+1)
+        {89.0f, 90.0f, -1, 1.0f, 2.0f},   // non-zero optical offset
+    };
+    for (const auto& sc : cases) {
+        const float thetaRad = sc.expectedTilt * 3.14159265359f / 180.0f;
+        const float y2 = cy - focal * std::tan(feetWorldAngle + thetaRad);
+        const float y1 = cy - focal * std::tan(headWorldAngle + thetaRad);
+        const PersonBox pbox{130.0f, y1, 189.0f, y2, 0.92f};
+        assert(analyzeFraming(pbox, w, h) == FramingStatus::FullBody);
+        float outTilt = 0.0f;
+        assert(groundHeightAtServo(pbox, w, h, focal, camH, sc.servoDeg,
+                                   sc.levelDeg, sc.dir, sc.offsetDeg, cm, distance, outTilt));
+        assert(std::fabs(outTilt - sc.expectedTilt) < 0.001f);
+        assert(std::fabs(cm - trueH) < 0.05f);
+        assert(std::fabs(distance - trueZ) < 0.005f);
+    }
 }

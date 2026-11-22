@@ -62,8 +62,41 @@ static esp_pm_lock_handle_t s_active_cpu_lock = nullptr;
 static esp_pm_lock_handle_t s_active_sleep_lock = nullptr;
 static esp_pm_lock_handle_t s_usb_sleep_lock = nullptr;
 static std::atomic<bool> s_usb_sleep_blocked{true};
+static SemaphoreHandle_t s_control_wake_sem = nullptr;
+static SemaphoreHandle_t s_lcd_wake_sem = nullptr;
+static std::atomic<bool> s_lcd_backlight_state{true};
+static std::atomic<uint32_t> s_wifi_connect_epoch{0};
 static void initPowerManagement();
 static void powerMonitorTask(void* arg);
+
+bool usbConnected() {
+    return usb_serial_jtag_is_connected();
+}
+
+uint32_t wifiConnectEpoch() {
+    return s_wifi_connect_epoch.load();
+}
+
+void edgeNotifyControl() {
+    if (s_control_wake_sem) {
+        xSemaphoreGive(s_control_wake_sem);
+    }
+}
+
+bool edgeWaitControl(uint32_t timeoutMs) {
+    if (!s_control_wake_sem) {
+        vTaskDelay(pdMS_TO_TICKS(timeoutMs == UINT32_MAX ? 100U : timeoutMs));
+        return false;
+    }
+    const TickType_t ticks = (timeoutMs == UINT32_MAX) ? portMAX_DELAY : pdMS_TO_TICKS(timeoutMs);
+    return xSemaphoreTake(s_control_wake_sem, ticks) == pdTRUE;
+}
+
+static void applyHoldSec(uint16_t holdSec) {
+    portENTER_CRITICAL(&s_state_mux);
+    s_measurements.setHoldMs(static_cast<uint32_t>(holdSec) * 1000U);
+    portEXIT_CRITICAL(&s_state_mux);
+}
 
 MeasurementView scaleSnapshot() {
     return scaleSampleSnapshot().measurement;
@@ -129,6 +162,7 @@ static bool s_in_config_session = false;
 static bool s_staging_valid = true;
 static bool s_wifi_config_invalid = false;
 static EdgeConfig s_staging_config;
+static std::atomic<UsbLineHandler> s_usb_line_handler{nullptr};
 
 static uint8_t s_scale_mac_le[6] = {};
 static bool s_scale_mac_enabled = false;
@@ -192,6 +226,42 @@ static bool parseFloatStrict(const std::string& val, float minVal, float maxVal,
     return false;
 }
 
+static bool parseUint16Strict(const std::string& val, uint16_t minVal, uint16_t maxVal, uint16_t& out) {
+    if (val.empty()) return false;
+    uint32_t acc = 0;
+    for (unsigned char c : val) {
+        if (c < '0' || c > '9') return false;
+        acc = acc * 10U + static_cast<uint32_t>(c - '0');
+        if (acc > maxVal) return false;
+    }
+    if (acc < minVal) return false;
+    out = static_cast<uint16_t>(acc);
+    return true;
+}
+
+static bool parseIntStrict(const std::string& val, int minVal, int maxVal, int& out) {
+    if (val.empty()) return false;
+    size_t idx = 0;
+    bool neg = false;
+    if (val[0] == '-') {
+        neg = true;
+        idx = 1;
+    }
+    if (idx >= val.size()) return false;
+    int64_t acc = 0;
+    for (; idx < val.size(); ++idx) {
+        const unsigned char c = static_cast<unsigned char>(val[idx]);
+        if (c < '0' || c > '9') return false;
+        acc = acc * 10 + static_cast<int64_t>(c - '0');
+        if (!neg && acc > maxVal) return false;
+        if (neg && -acc < minVal) return false;
+    }
+    const int64_t signedVal = neg ? -acc : acc;
+    if (signedVal < minVal || signedVal > maxVal) return false;
+    out = static_cast<int>(signedVal);
+    return true;
+}
+
 static void normalizeCameraUrl(char* url, size_t cap) {
     if (!url || !url[0]) return;
     size_t len = strlen(url);
@@ -227,6 +297,37 @@ static void sanitizeConfig(EdgeConfig& cfg) {
     if (!std::isfinite(cfg.tiltDeg) || cfg.tiltDeg < -79.0f || cfg.tiltDeg > 79.0f) {
         cfg.tiltDeg = 0.0f;
     }
+    if (cfg.holdSec > 60) {
+        cfg.holdSec = 10;
+    }
+    if (cfg.servoPin != -1 && !isValidServoPin(cfg.servoPin)) {
+        cfg.servoPin = kServoDefaultPin;
+    }
+    if (!std::isfinite(cfg.servoMinDeg) || !std::isfinite(cfg.servoMaxDeg) ||
+        cfg.servoMinDeg < kServoHardMinDeg || cfg.servoMaxDeg > kServoHardMaxDeg ||
+        cfg.servoMinDeg >= cfg.servoMaxDeg) {
+        cfg.servoMinDeg = kServoDefaultMinDeg;
+        cfg.servoMaxDeg = kServoDefaultMaxDeg;
+    }
+    cfg.servoBottomDeg = clampServoDeg(
+        std::isfinite(cfg.servoBottomDeg) ? cfg.servoBottomDeg : kServoDefaultBottomDeg,
+        cfg.servoMinDeg, cfg.servoMaxDeg);
+    cfg.servoTopDeg = clampServoDeg(
+        std::isfinite(cfg.servoTopDeg) ? cfg.servoTopDeg : kServoDefaultTopDeg,
+        cfg.servoMinDeg, cfg.servoMaxDeg);
+    if (!std::isfinite(cfg.servoStepDeg) || cfg.servoStepDeg < 1.0f || cfg.servoStepDeg > 30.0f) {
+        cfg.servoStepDeg = kServoDefaultStepDeg;
+    }
+    if (!std::isfinite(cfg.servoLevelDeg) ||
+        cfg.servoLevelDeg < kServoHardMinDeg || cfg.servoLevelDeg > kServoHardMaxDeg) {
+        cfg.servoLevelDeg = kServoDefaultLevelDeg;
+    }
+    if (cfg.servoDir != -1 && cfg.servoDir != 1) {
+        cfg.servoDir = kServoDefaultDir;
+    }
+    if (cfg.servoSettleMs < 50 || cfg.servoSettleMs > 2000) {
+        cfg.servoSettleMs = kServoDefaultSettleMs;
+    }
     normalizeMacLower(cfg.scaleMac);
     uint8_t dummy[6];
     if (cfg.scaleMac[0] != '\0' && !parseMacLe(cfg.scaleMac, dummy)) {
@@ -250,6 +351,16 @@ static void loadConfigFromNvs(EdgeConfig& cfg) {
         uint8_t gm = 0;
         if (nvs_get_u8(h, "gmode", &gm) == ESP_OK) cfg.groundMode = (gm != 0);
 
+        uint16_t holdSec = cfg.holdSec;
+        if (nvs_get_u16(h, "hold_sec", &holdSec) == ESP_OK) cfg.holdSec = holdSec;
+
+        int8_t srvPin = cfg.servoPin;
+        if (nvs_get_i8(h, "srv_pin", &srvPin) == ESP_OK) cfg.servoPin = srvPin;
+        int8_t srvDir = cfg.servoDir;
+        if (nvs_get_i8(h, "srv_dir", &srvDir) == ESP_OK) cfg.servoDir = srvDir;
+        uint16_t srvStl = cfg.servoSettleMs;
+        if (nvs_get_u16(h, "srv_stl", &srvStl) == ESP_OK) cfg.servoSettleMs = srvStl;
+
         sz = sizeof(float);
         nvs_get_blob(h, "dist", &cfg.distanceM, &sz);
         sz = sizeof(float);
@@ -260,15 +371,30 @@ static void loadConfigFromNvs(EdgeConfig& cfg) {
         nvs_get_blob(h, "cam_h", &cfg.cameraHeightCm, &sz);
         sz = sizeof(float);
         nvs_get_blob(h, "tilt", &cfg.tiltDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_min", &cfg.servoMinDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_max", &cfg.servoMaxDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_bot", &cfg.servoBottomDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_top", &cfg.servoTopDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_step", &cfg.servoStepDeg, &sz);
+        sz = sizeof(float);
+        nvs_get_blob(h, "srv_lvl", &cfg.servoLevelDeg, &sz);
 
         nvs_close(h);
     }
 
     sanitizeConfig(cfg);
     updateScaleMacFilter(cfg.scaleMac);
-    ESP_LOGI(TAG, "Configuration loaded: camera=%s mode=%s mac=%s",
+    applyHoldSec(cfg.holdSec);
+    ESP_LOGI(TAG, "Configuration loaded: camera=%s mode=%s mac=%s hold=%us servo_pin=%d",
              cfg.cameraUrl, cfg.groundMode ? "ground" : "fixed",
-             cfg.scaleMac[0] ? cfg.scaleMac : "(any)");
+             cfg.scaleMac[0] ? cfg.scaleMac : "(any)",
+             static_cast<unsigned>(cfg.holdSec),
+             static_cast<int>(cfg.servoPin));
 }
 
 static void saveConfigToNvs(const EdgeConfig& cfg) {
@@ -280,11 +406,21 @@ static void saveConfigToNvs(const EdgeConfig& cfg) {
     nvs_set_str(h, "camera", cfg.cameraUrl);
     nvs_set_str(h, "mac", cfg.scaleMac);
     nvs_set_u8(h, "gmode", cfg.groundMode ? 1 : 0);
+    nvs_set_u16(h, "hold_sec", cfg.holdSec);
+    nvs_set_i8(h, "srv_pin", cfg.servoPin);
+    nvs_set_i8(h, "srv_dir", cfg.servoDir);
+    nvs_set_u16(h, "srv_stl", cfg.servoSettleMs);
     nvs_set_blob(h, "dist", &cfg.distanceM, sizeof(float));
     nvs_set_blob(h, "ref_cm", &cfg.referenceCm, sizeof(float));
     nvs_set_blob(h, "focal", &cfg.focalPx, sizeof(float));
     nvs_set_blob(h, "cam_h", &cfg.cameraHeightCm, sizeof(float));
     nvs_set_blob(h, "tilt", &cfg.tiltDeg, sizeof(float));
+    nvs_set_blob(h, "srv_min", &cfg.servoMinDeg, sizeof(float));
+    nvs_set_blob(h, "srv_max", &cfg.servoMaxDeg, sizeof(float));
+    nvs_set_blob(h, "srv_bot", &cfg.servoBottomDeg, sizeof(float));
+    nvs_set_blob(h, "srv_top", &cfg.servoTopDeg, sizeof(float));
+    nvs_set_blob(h, "srv_step", &cfg.servoStepDeg, sizeof(float));
+    nvs_set_blob(h, "srv_lvl", &cfg.servoLevelDeg, sizeof(float));
 
     nvs_commit(h);
     nvs_close(h);
@@ -421,7 +557,6 @@ static void wifiEventHandler(void* arg, esp_event_base_t event_base,
         memcpy(s_wifi_desired_config.sta.ssid, credentials.ssid.data(), credentials.ssid.size());
         memcpy(s_wifi_desired_config.sta.password, credentials.password.data(), credentials.password.size());
         s_wifi_desired_config.sta.threshold.authmode = credentials.open ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA_WPA2_PSK;
-        s_wifi_desired_config.sta.listen_interval = 3;
         if (s_wifi_waiting_stop) return; // Keep the newest config until STOP.
         if (s_wifi_started.load()) {
             // STOP is an event-ordering fence: old disconnect/start events are
@@ -469,6 +604,7 @@ static void wifiEventHandler(void* arg, esp_event_base_t event_base,
         strcpy(s_wifi_ip, ip);
         portEXIT_CRITICAL(&s_ip_mux);
         s_wifi_ready.store(true);
+        s_wifi_connect_epoch.fetch_add(1);
     }
 }
 
@@ -561,6 +697,17 @@ void usbFrame(const uint8_t* jpeg, size_t length, const char* metadata) {
     xSemaphoreGive(s_usb_tx_mutex);
 }
 
+void setUsbLineHandler(UsbLineHandler handler) {
+    s_usb_line_handler.store(handler);
+}
+
+void usbWriteText(const char* text) {
+    if (!text || !text[0] || !usb_serial_jtag_is_connected()) return;
+    if (!s_usb_tx_mutex || xSemaphoreTake(s_usb_tx_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    usbWriteAll(text, strlen(text), 200);
+    xSemaphoreGive(s_usb_tx_mutex);
+}
+
 static void processConfigLine(const std::string& line) {
     if (line == "BEGIN") {
         s_staging_config = configSnapshot();
@@ -625,6 +772,36 @@ static void processConfigLine(const std::string& line) {
             if (!parseFloatStrict(val, 0.0f, 400.0f, s_staging_config.cameraHeightCm, true)) s_staging_valid = false;
         } else if (key == "tilt") {
             if (!parseFloatStrict(val, -79.0f, 79.0f, s_staging_config.tiltDeg)) s_staging_valid = false;
+        } else if (key == "hold_sec") {
+            if (!parseUint16Strict(val, 0, 60, s_staging_config.holdSec)) s_staging_valid = false;
+        } else if (key == "servo_pin") {
+            int pin = 0;
+            if (!parseIntStrict(val, -1, 48, pin) || (pin != -1 && !isValidServoPin(pin))) {
+                s_staging_valid = false;
+            } else {
+                s_staging_config.servoPin = static_cast<int8_t>(pin);
+            }
+        } else if (key == "servo_min") {
+            if (!parseFloatStrict(val, kServoHardMinDeg, kServoHardMaxDeg, s_staging_config.servoMinDeg)) s_staging_valid = false;
+        } else if (key == "servo_max") {
+            if (!parseFloatStrict(val, kServoHardMinDeg, kServoHardMaxDeg, s_staging_config.servoMaxDeg)) s_staging_valid = false;
+        } else if (key == "servo_bottom") {
+            if (!parseFloatStrict(val, kServoHardMinDeg, kServoHardMaxDeg, s_staging_config.servoBottomDeg)) s_staging_valid = false;
+        } else if (key == "servo_top") {
+            if (!parseFloatStrict(val, kServoHardMinDeg, kServoHardMaxDeg, s_staging_config.servoTopDeg)) s_staging_valid = false;
+        } else if (key == "servo_step") {
+            if (!parseFloatStrict(val, 1.0f, 30.0f, s_staging_config.servoStepDeg)) s_staging_valid = false;
+        } else if (key == "servo_level") {
+            if (!parseFloatStrict(val, kServoHardMinDeg, kServoHardMaxDeg, s_staging_config.servoLevelDeg)) s_staging_valid = false;
+        } else if (key == "servo_dir") {
+            int dir = 0;
+            if (!parseIntStrict(val, -1, 1, dir) || (dir != -1 && dir != 1)) {
+                s_staging_valid = false;
+            } else {
+                s_staging_config.servoDir = static_cast<int8_t>(dir);
+            }
+        } else if (key == "servo_settle") {
+            if (!parseUint16Strict(val, 50, 2000, s_staging_config.servoSettleMs)) s_staging_valid = false;
         } else {
             ESP_LOGW(TAG, "Unknown configuration key '%s'", key.c_str());
             s_staging_valid = false;
@@ -636,9 +813,15 @@ static void processConfigLine(const std::string& line) {
             std::string_view(s_staging_config.ssid, strnlen(s_staging_config.ssid, sizeof(s_staging_config.ssid))),
             std::string_view(s_staging_config.password, strnlen(s_staging_config.password, sizeof(s_staging_config.password))),
             credentials);
-        if (!s_staging_valid || s_wifi_config_invalid || wifi_error) {
+        const bool servoRangeValid =
+            s_staging_config.servoMinDeg < s_staging_config.servoMaxDeg &&
+            s_staging_config.servoBottomDeg >= s_staging_config.servoMinDeg &&
+            s_staging_config.servoBottomDeg <= s_staging_config.servoMaxDeg &&
+            s_staging_config.servoTopDeg >= s_staging_config.servoMinDeg &&
+            s_staging_config.servoTopDeg <= s_staging_config.servoMaxDeg;
+        if (!s_staging_valid || s_wifi_config_invalid || wifi_error || !servoRangeValid) {
             ESP_LOGW(TAG, "Rejected invalid configuration session (%s)",
-                     wifi_error ? wifi_error : "invalid parameter");
+                     wifi_error ? wifi_error : (servoRangeValid ? "invalid parameter" : "invalid servo bounds"));
             usbFrame(nullptr, 0, "{\"kind\":\"config\",\"ok\":false}");
             return;
         }
@@ -651,13 +834,21 @@ static void processConfigLine(const std::string& line) {
         s_config = s_staging_config;
         saveConfigToNvs(s_config);
         updateScaleMacFilter(s_config.scaleMac);
+        const uint16_t appliedHoldSec = s_config.holdSec;
         xSemaphoreGive(s_config_mutex);
 
+        applyHoldSec(appliedHoldSec);
         clearMeasurementHold();
+        edgeNotifyControl();
         if (wifi_changed || needs_wifi_start) {
             applyWifiConfig(s_staging_config);
         }
         usbFrame(nullptr, 0, "{\"kind\":\"config\",\"ok\":true}");
+    } else if (!s_in_config_session) {
+        const auto handler = s_usb_line_handler.load();
+        if (handler) {
+            handler(line.c_str());
+        }
     }
 }
 
@@ -666,7 +857,7 @@ static void usbReceiverTask(void* pvParameters) {
     std::string line_accum;
     line_accum.reserve(260);
     while (true) {
-        const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), pdMS_TO_TICKS(50));
+        const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), portMAX_DELAY);
         for (int i = 0; i < n; ++i) {
             const char c = static_cast<char>(buf[i]);
             if (c == '\n' || c == '\r') {
@@ -750,11 +941,11 @@ static void lcdWriteByte(uint8_t val, bool is_data) {
 // back to byte alignment without flickering the screen.
 static void lcdResync4Bit() {
     pcfExpanderWrite(0x00);
-    esp_rom_delay_us(1000);
+    vTaskDelay(pdMS_TO_TICKS(2));
     pcfWriteNibble(0x30, false);
-    esp_rom_delay_us(4500);
+    vTaskDelay(pdMS_TO_TICKS(6));
     pcfWriteNibble(0x30, false);
-    esp_rom_delay_us(4500);
+    vTaskDelay(pdMS_TO_TICKS(6));
     pcfWriteNibble(0x30, false);
     esp_rom_delay_us(200);
     pcfWriteNibble(0x20, false); // Enter 4-bit mode, aligned on high nibble
@@ -870,13 +1061,22 @@ void lcdMessage(const char* first, const char* second) {
 
 void lcdSetBacklight(bool on) {
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    const bool prev = s_lcd_backlight;
     s_lcd_backlight = on;
+    s_lcd_backlight_state.store(on);
+    if (on && !prev) {
+        s_lcd_prev_valid[0] = false;
+        s_lcd_prev_valid[1] = false;
+    }
     if (s_lcd_ready) {
         // E=0: changing only the backlight does not latch an LCD command.
         const uint8_t value = on ? 0x08 : 0x00;
         i2cTransmit(&value, 1);
     }
     xSemaphoreGive(s_lcd_mutex);
+    if (on && !prev && s_lcd_wake_sem) {
+        xSemaphoreGive(s_lcd_wake_sem);
+    }
 }
 
 void lcdHoldResult(const MeasurementView* result) {
@@ -885,35 +1085,47 @@ void lcdHoldResult(const MeasurementView* result) {
     if (s_lcd_holding) s_lcd_result = *result;
     s_lcd_override_until = 0;
     s_lcd_override_active = false;
+    const bool wake = s_lcd_holding;
     xSemaphoreGive(s_lcd_mutex);
+    if (wake && s_lcd_wake_sem) {
+        xSemaphoreGive(s_lcd_wake_sem);
+    }
 }
 
 static void lcdTask(void* pvParameters) {
     uint32_t last_lcd_probe = clockMs();
     uint32_t resync_counter = 0;
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(250));
+        if (!s_lcd_backlight_state.load()) {
+            resync_counter = 0;
+            xSemaphoreTake(s_lcd_wake_sem, portMAX_DELAY);
+            continue;
+        }
         const uint32_t now = clockMs();
 
         if (!s_lcd_ready) {
             if (now - last_lcd_probe >= 5000) {
                 last_lcd_probe = now;
                 xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-                initLcdHardware();
-                if (s_lcd_ready && s_lcd_override_active &&
-                    static_cast<int32_t>(s_lcd_override_until - clockMs()) > 0) {
-                    lcdSetLine(0, s_lcd_msg_first);
-                    lcdSetLine(1, s_lcd_msg_second);
+                if (s_lcd_backlight) {
+                    initLcdHardware();
+                    if (s_lcd_ready && s_lcd_override_active &&
+                        static_cast<int32_t>(s_lcd_override_until - clockMs()) > 0) {
+                        lcdSetLine(0, s_lcd_msg_first);
+                        lcdSetLine(1, s_lcd_msg_second);
+                    }
                 }
                 xSemaphoreGive(s_lcd_mutex);
             }
+            xSemaphoreTake(s_lcd_wake_sem, pdMS_TO_TICKS(250));
             continue;
         }
 
         xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
         if (!s_lcd_backlight) {
+            resync_counter = 0;
             xSemaphoreGive(s_lcd_mutex);
-            continue; // Avoid continuous I2C writes while asleep.
+            continue; // Avoid I2C writes while asleep.
         }
         // Every 3 seconds (12 * 250 ms), re-assert 4-bit nibble alignment and
         // force-refresh both lines so any I2C wire glitch self-heals cleanly.
@@ -934,80 +1146,83 @@ static void lcdTask(void* pvParameters) {
             lcdSetLine(0, "Mi Scale 2 ready");
             lcdSetLine(1, "Step on scale");
         }
-        xSemaphoreGive(s_lcd_mutex);
-        continue;
-#endif
+#else
+        bool overrideDrawn = false;
         if (s_lcd_override_active) {
             if (static_cast<int32_t>(s_lcd_override_until - now) > 0) {
                 lcdSetLine(0, s_lcd_msg_first);
                 lcdSetLine(1, s_lcd_msg_second);
-                xSemaphoreGive(s_lcd_mutex);
-                continue;
+                overrideDrawn = true;
+            } else {
+                s_lcd_override_active = false;
             }
-            s_lcd_override_active = false;
         }
 
-        const auto view = s_lcd_holding ? s_lcd_result : stateSnapshot();
-        const auto scale = scaleSnapshot();
-        const uint32_t phase = (now / 2500) % 2;
+        if (!overrideDrawn) {
+            const auto view = s_lcd_holding ? s_lcd_result : stateSnapshot();
+            const auto scale = scaleSnapshot();
+            const uint32_t phase = (now / 2500) % 2;
 
-        if (!s_lcd_holding && !powerModeActive()) {
-            if (scale.hasWeight) {
-                char l0[20];
-                snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+            if (!s_lcd_holding && !powerModeActive()) {
+                if (scale.hasWeight) {
+                    char l0[20];
+                    snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+                    lcdSetLine(0, l0);
+                    lcdSetLine(1, "Step on scale");
+                } else {
+                    lcdSetLine(0, "SmartScale Ready");
+                    lcdSetLine(1, "Step on scale");
+                }
+            } else if (view.status == PersonStatus::None) {
+                if (scale.hasWeight) {
+                    char l0[20];
+                    snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+                    lcdSetLine(0, l0);
+                    lcdSetLine(1, "Look at camera");
+                } else {
+                    lcdSetLine(0, "No people");
+                    lcdSetLine(1, "detected");
+                }
+            } else if (view.status == PersonStatus::Multiple) {
+                lcdSetLine(0, "Multiple people");
+                lcdSetLine(1, "One at a time");
+            } else if (phase == 0) {
+                char l0[20], l1[20];
+                if (view.hasHeight) snprintf(l0, sizeof(l0), "H:%.1fcm", view.heightCm);
+                else snprintf(l0, sizeof(l0), "H:-- (calib)");
+
+                if (view.hasWeight) {
+                    snprintf(l1, sizeof(l1), "W:%.2fkg %s", view.weightKg, view.weightStable ? "LOCK" : "...");
+                } else {
+                    snprintf(l1, sizeof(l1), "W:-- wait scale");
+                }
                 lcdSetLine(0, l0);
-                lcdSetLine(1, "Step on scale");
+                lcdSetLine(1, l1);
+            } else if (view.status == PersonStatus::NeedsCalibration) {
+                lcdSetLine(0, "Person detected");
+                lcdSetLine(1, "Need calibration");
+            } else if (view.status == PersonStatus::Partial) {
+                lcdSetLine(0, "Person detected");
+                lcdSetLine(1, "Full body needed");
             } else {
-                lcdSetLine(0, "SmartScale Ready");
-                lcdSetLine(1, "Step on scale");
-            }
-        } else if (view.status == PersonStatus::None) {
-            if (scale.hasWeight) {
-                char l0[20];
-                snprintf(l0, sizeof(l0), "W:%.2fkg %s", scale.weightKg, scale.weightStable ? "LOCK" : "...");
+                char l0[20], l1[20];
+                if (view.hasHeight) {
+                    if (view.held || s_lcd_holding) snprintf(l0, sizeof(l0), "D:%.2fm HOLD", view.distanceM);
+                    else snprintf(l0, sizeof(l0), "D:%.2fm", view.distanceM);
+                } else {
+                    snprintf(l0, sizeof(l0), "D:--");
+                }
+
+                if (view.hasBMI) snprintf(l1, sizeof(l1), "BMI:%.2f", view.bmi);
+                else snprintf(l1, sizeof(l1), "BMI:-- wait lock");
+
                 lcdSetLine(0, l0);
-                lcdSetLine(1, "Look at camera");
-            } else {
-                lcdSetLine(0, "No people");
-                lcdSetLine(1, "detected");
+                lcdSetLine(1, l1);
             }
-        } else if (view.status == PersonStatus::Multiple) {
-            lcdSetLine(0, "Multiple people");
-            lcdSetLine(1, "One at a time");
-        } else if (phase == 0) {
-            char l0[20], l1[20];
-            if (view.hasHeight) snprintf(l0, sizeof(l0), "H:%.1fcm", view.heightCm);
-            else snprintf(l0, sizeof(l0), "H:-- (calib)");
-
-            if (view.hasWeight) {
-                snprintf(l1, sizeof(l1), "W:%.2fkg %s", view.weightKg, view.weightStable ? "LOCK" : "...");
-            } else {
-                snprintf(l1, sizeof(l1), "W:-- wait scale");
-            }
-            lcdSetLine(0, l0);
-            lcdSetLine(1, l1);
-        } else if (view.status == PersonStatus::NeedsCalibration) {
-            lcdSetLine(0, "Person detected");
-            lcdSetLine(1, "Need calibration");
-        } else if (view.status == PersonStatus::Partial) {
-            lcdSetLine(0, "Person detected");
-            lcdSetLine(1, "Full body needed");
-        } else {
-            char l0[20], l1[20];
-            if (view.hasHeight) {
-                if (view.held || s_lcd_holding) snprintf(l0, sizeof(l0), "D:%.2fm HOLD", view.distanceM);
-                else snprintf(l0, sizeof(l0), "D:%.2fm", view.distanceM);
-            } else {
-                snprintf(l0, sizeof(l0), "D:--");
-            }
-
-            if (view.hasBMI) snprintf(l1, sizeof(l1), "BMI:%.2f", view.bmi);
-            else snprintf(l1, sizeof(l1), "BMI:-- wait lock");
-
-            lcdSetLine(0, l0);
-            lcdSetLine(1, l1);
         }
+#endif
         xSemaphoreGive(s_lcd_mutex);
+        xSemaphoreTake(s_lcd_wake_sem, pdMS_TO_TICKS(250));
     }
 }
 
@@ -1079,12 +1294,16 @@ static void initPowerManagement() {
 static void powerMonitorTask(void* arg) {
     while (true) {
         const bool connected = usb_serial_jtag_is_connected();
-        if (connected != s_usb_sleep_blocked.load()) {
+        const bool prev = s_usb_sleep_blocked.load();
+        if (connected != prev) {
             if (connected) ESP_ERROR_CHECK(esp_pm_lock_acquire(s_usb_sleep_lock));
             else ESP_ERROR_CHECK(esp_pm_lock_release(s_usb_sleep_lock));
             s_usb_sleep_blocked.store(connected);
+            if (connected) {
+                edgeNotifyControl();
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(connected ? 250 : 1000));
     }
 }
 
@@ -1100,6 +1319,7 @@ EdgePowerView powerSnapshot() {
     out.cpuMhz = esp_clk_cpu_freq() / 1000000;
     out.usbSleepBlocked = s_usb_sleep_blocked.load();
     out.wifiStarted = s_wifi_started.load();
+    out.lcdBacklight = s_lcd_backlight_state.load();
     out.noLightSleepLocks = (s_power_active.load() ? 1 : 0) +
                             (s_usb_sleep_blocked.load() ? 1 : 0);
     wifi_ps_type_t ps;
@@ -1116,7 +1336,7 @@ void bleSetLowPowerScan(bool standby) {
     bleRequestScan();
 }
 
-void setPowerMode(bool active) {
+void setPowerMode(bool active, bool keepLcdOn) {
     if (s_power_active.load() == active) return;
     if (active) {
         configureCpuPower(true);
@@ -1127,18 +1347,23 @@ void setPowerMode(bool active) {
         s_lcd_override_active = false;
         xSemaphoreGive(s_lcd_mutex);
     }
-    applyWifiPowerSave(active);
-    // Keep LCD backlight ON in both ACTIVE and STANDBY so the screen is always visible.
-    lcdSetBacklight(true);
-    bleSetLowPowerScan(!active);
     s_power_active.store(active);
+    applyWifiPowerSave(active);
+    const bool lcdOn = active || keepLcdOn;
+    lcdSetBacklight(lcdOn);
+    if (active && s_lcd_wake_sem) {
+        xSemaphoreGive(s_lcd_wake_sem);
+    }
+    bleSetLowPowerScan(!active);
     if (!active) {
         ESP_ERROR_CHECK(esp_pm_lock_release(s_active_sleep_lock));
         ESP_ERROR_CHECK(esp_pm_lock_release(s_active_cpu_lock));
         configureCpuPower(false);
     }
-    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%.1f%%", active ? "ACTIVE" : "STANDBY",
-             bleScanDutyPercent());
+    ESP_LOGI(TAG, "Power phase=%s; BLE duty=%.1f%%; LCD=%s",
+             active ? "ACTIVE" : "STANDBY",
+             bleScanDutyPercent(),
+             lcdOn ? "ON" : "OFF");
 }
 
 static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
@@ -1153,6 +1378,7 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
             return 0;
         }
 
+        bool sawScale = false;
         const uint8_t* data = event->disc.data;
         const int len = event->disc.length_data;
         int idx = 0;
@@ -1182,9 +1408,13 @@ static int bleGapEventHandler(struct ble_gap_event* event, void* arg) {
                         s_measurements.weight(now, kg, is_stable);
                     }
                     portEXIT_CRITICAL(&s_state_mux);
+                    sawScale = true;
                 }
             }
             idx += ad_len + 1;
+        }
+        if (sawScale) {
+            edgeNotifyControl();
         }
     } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
         s_ble_scan_duty.store(0);
@@ -1231,6 +1461,9 @@ static void bleStartScan() {
         }
         ble_npl_callout_stop(&s_ble_scan_retry_callout);
         s_ble_scan_retry.clear();
+        if (usb_serial_jtag_is_connected()) {
+            edgeNotifyControl();
+        }
     } else if (rc == BLE_HS_EINVAL || rc == BLE_HS_ENOTSUP) {
         // Invalid parameters / unsupported feature need a configuration fix.
         ble_npl_callout_stop(&s_ble_scan_retry_callout);
@@ -1258,6 +1491,9 @@ static void bleHostTask(void* param) {
 void edgeIoInit() {
     s_config_mutex = xSemaphoreCreateMutex();
     s_lcd_mutex = xSemaphoreCreateMutex();
+    s_control_wake_sem = xSemaphoreCreateBinary();
+    s_lcd_wake_sem = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(s_config_mutex && s_lcd_mutex && s_control_wake_sem && s_lcd_wake_sem ? ESP_OK : ESP_ERR_NO_MEM);
     initPowerManagement();
 
     // 1. NVS
@@ -1276,13 +1512,13 @@ void edgeIoInit() {
     usb_cfg.tx_buffer_size = 4096;
     usb_cfg.rx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&usb_cfg);
-    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(powerMonitorTask, "power_monitor", 3072, nullptr, 3, nullptr, 0) == pdPASS
+    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(powerMonitorTask, "power_monitor", 2048, nullptr, 3, nullptr, 0) == pdPASS
                     ? ESP_OK : ESP_ERR_NO_MEM);
-    xTaskCreatePinnedToCore(usbReceiverTask, "usb_rx", 6144, nullptr, 4, nullptr, 0);
+    xTaskCreatePinnedToCore(usbReceiverTask, "usb_rx", 4096, nullptr, 4, nullptr, 0);
 
     // 3. LCD & Display Task
     initLcdHardware();
-    xTaskCreatePinnedToCore(lcdTask, "lcd_ui", 6144, nullptr, 3, nullptr, 0);
+    xTaskCreatePinnedToCore(lcdTask, "lcd_ui", 4096, nullptr, 3, nullptr, 0);
 
     // 4. Wi-Fi
     esp_netif_init();

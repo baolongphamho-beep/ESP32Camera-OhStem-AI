@@ -31,6 +31,12 @@ public:
 
     explicit MeasurementState(uint32_t holdMs = MEASUREMENT_HOLD_MS) : holdMs_(holdMs) {}
 
+    void setHoldMs(uint32_t holdMs) {
+        holdMs_ = holdMs;
+        if (holdMs_ == 0) clearHold();
+    }
+    uint32_t holdMs() const { return holdMs_; }
+
     void camera(uint32_t now, PersonStatus status, float height = 0, float distance = 0) {
         if (status == PersonStatus::Multiple) {
             clearHold();

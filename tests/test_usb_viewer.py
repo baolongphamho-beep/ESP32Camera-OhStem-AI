@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "camera"))
-from usb_viewer import format_metric, format_timing_line, validate_mac
+from usb_viewer import format_metric, format_timing_line, validate_hold_sec, validate_mac
 
 
 class USBViewerHelperTests(unittest.TestCase):
@@ -19,6 +19,17 @@ class USBViewerHelperTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     validate_mac(bad)
+
+    def test_validate_hold_sec_accepts_bounds_and_rejects_invalid(self):
+        self.assertEqual(validate_hold_sec(""), 10)
+        self.assertEqual(validate_hold_sec("   ", default=15), 15)
+        self.assertEqual(validate_hold_sec("0"), 0)
+        self.assertEqual(validate_hold_sec(" 10 "), 10)
+        self.assertEqual(validate_hold_sec("60"), 60)
+        for bad in ("-1", "61", "10.5", "abc", "+10"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    validate_hold_sec(bad)
 
     def test_format_metric_handles_missing_and_valid_values(self):
         self.assertEqual(format_metric(None, "cm", ".1f"), "--")

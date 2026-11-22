@@ -52,8 +52,39 @@ class USBProtocolTests(unittest.TestCase):
         for value in ("abc\nAPPLY", "\x00", "é" * 17):
             with self.assertRaises(ValueError):
                 config_commands({"ssid": value})
-        self.assertEqual(config_commands({"mode": "fixed", "focal": 0}),
-                         b"BEGIN\nCFG mode=fixed\nCFG focal=0\nAPPLY\n")
+        with self.assertRaises(ValueError):
+            config_commands({"hold_sec": "1000"})
+        with self.assertRaises(ValueError):
+            config_commands({"hold_sec": "10\nAPPLY"})
+        self.assertEqual(config_commands({"mode": "fixed", "focal": 0, "hold_sec": 10}),
+                         b"BEGIN\nCFG mode=fixed\nCFG focal=0\nCFG hold_sec=10\nAPPLY\n")
+
+    def test_configuration_supports_servo_keys_and_validates_bounds(self):
+        payload = config_commands({
+            "servo_pin": 10,
+            "servo_min": 40,
+            "servo_max": 140,
+            "servo_bottom": 68,
+            "servo_top": 95,
+            "servo_step": 4.5,
+            "servo_level": 90,
+            "servo_dir": -1,
+            "servo_settle": 200,
+        })
+        self.assertEqual(
+            payload,
+            b"BEGIN\nCFG servo_pin=10\nCFG servo_min=40\nCFG servo_max=140\n"
+            b"CFG servo_bottom=68\nCFG servo_top=95\nCFG servo_step=4.5\n"
+            b"CFG servo_level=90\nCFG servo_dir=-1\nCFG servo_settle=200\nAPPLY\n",
+        )
+        with self.assertRaises(ValueError):
+            config_commands({"servo_pin": "10000"})
+        with self.assertRaises(ValueError):
+            config_commands({"servo_dir": "-10"})
+        with self.assertRaises(ValueError):
+            config_commands({"servo_settle": "20000"})
+        with self.assertRaises(ValueError):
+            config_commands({"servo_level": "90\nAPPLY"})
 
 
 if __name__ == "__main__":

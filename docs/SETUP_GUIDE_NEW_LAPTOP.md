@@ -125,7 +125,7 @@ Kiểm tra xem toàn bộ thuật toán hình học tính chiều cao, bộ gi�
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
-**Kết quả mong đợi:** Toàn bộ 15 tests đều hiện `ok` (`Ran 15 tests ... OK`).
+**Kết quả mong đợi:** Toàn bộ 29 tests đều hiện `ok` (`Ran 29 tests ... OK`).
 
 ---
 
@@ -235,9 +235,11 @@ Chương trình sẽ hỏi tương tác từng mục:
 1. **WiFi SSID:** Nhập tên mạng Wi-Fi 2.4GHz (cùng mạng với Camera AI, ví dụ `HCMUT-MEETING`).
 2. **WiFi password:** Nhập mật khẩu Wi-Fi.
 3. **URL hoặc IP camera:** Nhập địa chỉ IP hiện trên màn hình OLED của Camera AI (ví dụ gõ `10.127.7.68` hoặc `http://10.127.7.68/capture` — chương trình sẽ tự động thêm `/capture`).
-4. **Chế độ `fixed` / `ground`:**
-   - Chọn `fixed` (mặc định): Nhập khoảng cách từ camera đến vị trí đứng trên cân (m), chiều cao thật của người chuẩn đầu tiên (cm), và nhập `fy/H = 0` để mạch tự hiệu chuẩn tiêu cự ngay khung hình toàn thân đầu tiên.
+4. **MAC cân Mi Scale 2:** Nhập địa chỉ MAC của cân (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` để tắt lọc MAC, hoặc nhấn `Enter` để giữ nguyên).
+5. **Chế độ `fixed` / `ground`:**
+   - Chọn `fixed` (mặc định): Nhập khoảng cách từ camera đến vị trí đứng trên cân (m), chiều cao thật của người chuẩn đầu tiên (cm), và nhập `fy/H = 0` để mạch tự hiệu chuẩn tiêu cự sau 3 khung hình toàn thân liên tiếp ổn định (độ lệch ≤ 5%).
    - Hoặc chọn `ground`: Nhập độ cao tâm camera so với mặt bàn cân (cm), góc nghiêng xuống (độ) và hệ số tiêu cự `fy/H`.
+6. **Thời gian giữ kết quả LCD (`hold_sec`):** Nhập số giây giữ kết quả trên LCD sau khi bước xuống khỏi cân (dải `0..60`, `0 = tắt giữ`, mặc định **`10`** giây).
 
 > [!TIP]
 > Ngay khi hiện **`Da luu cau hinh.`**, toàn bộ thông số được lưu vĩnh viễn vào bộ nhớ **NVS Flash** của YOLO UNO và cửa sổ xem ảnh trực tiếp sẽ mở ra ngay lập tức!
@@ -256,19 +258,15 @@ Cửa sổ **SmartScale - YOLO UNO USB viewer** sẽ hiển thị trực tiếp 
 Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toàn cáp kết nối với laptop**:
 
 1. Cấp nguồn 5V cho bo YOLO UNO bằng củ sạc hoặc pin dự phòng.
-2. Khi chưa có ai đứng trong khung hình, màn hình LCD 16×2 hiển thị:
-   ```text
-   No people
-   detected
-   ```
-3. Người dùng bước vào khung hình camera và đứng lên cân **Mi Scale 2**:
-   - Bo mạch YOLO UNO nhận ảnh từ camera qua Wi-Fi (Core 0), chạy mô hình YOLO26n INT8 trên chip (Core 1) và làm mượt chiều cao theo trung vị khung hình.
+2. Khi không có người trên cân (`STANDBY`): hệ thống tự hạ CPU về 80 MHz, tạm dừng camera/AI và **tắt đèn nền màn hình LCD** để tiết kiệm điện, chỉ giữ quét BLE chu kỳ thấp (10%).
+3. Người dùng bước lên cân **Mi Scale 2** (`> 5 kg`) và đứng vào khung hình camera:
+   - Bo mạch YOLO UNO thức dậy tức thời (`< 1 s`), bật sáng đèn nền LCD, tăng CPU lên 240 MHz, nhận ảnh QVGA từ camera qua Wi-Fi (Core 0), chạy mô hình YOLO26n INT8 trên chip (Core 1) và làm mượt chiều cao theo trung vị 5 khung hình.
    - Đồng thời YOLO UNO nhận gói quảng bá BLE `0x181D` từ cân Mi Scale 2 (lọc theo địa chỉ MAC đã cấu hình).
    - Màn hình LCD luân phiên mỗi 2,5 giây giữa:
      - Trang 1: `H:172.0cm` / `W:65.40kg ...` (khi đang cân) hoặc `W:65.40kg LOCK` (khi cân đã chốt ổn định)
      - Trang 2: `D:2.50m` / `BMI:22.11` (chỉ tính BMI khi đã có chiều cao hợp lệ và cân nặng đã `LOCK`)
 4. Bước xuống khỏi cân để đọc kết quả:
-   - Khi đã có đầy đủ H, W `LOCK` và BMI, kết quả được giữ lại thêm **12 giây** (`D:2.50m HOLD` / `BMI:22.11`) để người đo kịp bước xuống xem màn hình LCD trước khi quay về `No people / detected` (hoặc cập nhật ngay khi có người mới bước lên cân).
+   - Khi đã có đầy đủ H, W `LOCK` và BMI, màn hình LCD tiếp tục sáng liền mạch và giữ kết quả trong **`10` giây** mặc định (cấu hình được `0..60s` qua `hold_sec`: `D:2.50m HOLD` / `BMI:22.11`) để người đo kịp bước xuống xem trước khi tắt đèn nền về `STANDBY` (hoặc chuyển sang lượt đo mới ngay khi có người khác bước lên cân).
 5. Toàn bộ chu trình hoạt động hoàn toàn tự động, khép kín trên chip mà không cần máy tính phụ trợ!
 
 ---

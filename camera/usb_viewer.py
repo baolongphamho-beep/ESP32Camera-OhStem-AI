@@ -18,6 +18,18 @@ def validate_mac(text):
     return stripped.lower()
 
 
+def validate_hold_sec(text, default=10):
+    stripped = text.strip()
+    if not stripped:
+        return default
+    if not re.fullmatch(r"[0-9]+", stripped):
+        raise ValueError("Thoi gian giu ket qua phai la so nguyen tu 0 den 60 giay.")
+    value = int(stripped)
+    if not 0 <= value <= 60:
+        raise ValueError("Thoi gian giu ket qua phai la so nguyen tu 0 den 60 giay.")
+    return value
+
+
 def format_metric(value, unit="", fmt=".1f"):
     if value is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return "--"
@@ -152,6 +164,14 @@ def configure():
         values["height"] = ask_number("Tam camera cao hon mat can (cm)", 100, 1, 400)
         values["tilt"] = ask_number("Goc nghieng xuong (do, duong = xuong)", 0, -79, 79)
         values["focal"] = ask_number("fy/H (lay tu hieu chuan camera)", 1, .01, 20)
+
+    while True:
+        hold_raw = input("Thoi gian giu ket qua LCD sau khi buoc xuong (giay, 0..60, 0 = tat) [10]: ")
+        try:
+            values["hold_sec"] = validate_hold_sec(hold_raw, default=10)
+            break
+        except ValueError as exc:
+            print(exc)
     return config_commands(values)
 
 

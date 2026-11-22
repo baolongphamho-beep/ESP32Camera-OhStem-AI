@@ -2,21 +2,26 @@
 #include "edge_geometry.h"
 #include "capture_gate.h"
 #include "http_capture_parser.h"
+#include "servo_ctrl.h"
+#include "standby_schedule.h"
 #include "dl_model_base.hpp"
 #include "yolo26.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <lwip/inet.h>
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
+#include <new>
 #include <sys/select.h>
 #include <unistd.h>
 #include <vector>
@@ -45,6 +50,7 @@ static constexpr int cameraTargetMaxWidth(int framesize) {
 static void powerTelemetry(const char* phase, uint32_t generation, const MeasurementView* held = nullptr) {
     const auto scale = held ? *held : scaleSnapshot();
     const auto power = powerSnapshot();
+    const auto cfg = configSnapshot();
     char json[768], weight[24] = "null", height[24] = "null", distance[24] = "null", bmi[24] = "null";
     if (scale.hasHeight) {
         snprintf(height, sizeof(height), "%.1f", scale.heightCm);
@@ -57,12 +63,14 @@ static void powerTelemetry(const char* phase, uint32_t generation, const Measure
         "\"weight_kg\":%s,\"weight_stable\":%s,\"pm_enabled\":%s,\"cpu_mhz\":%d,"
         "\"cpu_min_mhz\":%d,\"cpu_max_mhz\":%d,\"light_sleep_enabled\":%s,"
         "\"usb_sleep_blocked\":%s,\"no_ls_locks\":%d,\"wifi_ps\":\"%s\",\"wifi_started\":%s,"
+        "\"lcd_backlight\":%s,\"hold_sec\":%u,"
         "\"height_cm\":%s,\"distance_m\":%s,\"bmi\":%s}",
         phase, static_cast<unsigned long>(generation), bleScanDutyPercent(), weight,
         scale.weightStable ? "true" : "false", power.pmEnabled ? "true" : "false", power.cpuMhz,
         power.minCpuMhz, power.maxCpuMhz, power.lightSleepConfigured ? "true" : "false",
         power.usbSleepBlocked ? "true" : "false", power.noLightSleepLocks, power.wifiPowerSave,
-        power.wifiStarted ? "true" : "false", height, distance, bmi);
+        power.wifiStarted ? "true" : "false", power.lcdBacklight ? "true" : "false",
+        static_cast<unsigned>(cfg.holdSec), height, distance, bmi);
     usbFrame(nullptr, 0, json);
 }
 
@@ -568,6 +576,7 @@ static uint8_t* s_jpeg_buffers[2] = {nullptr, nullptr};
 static SemaphoreHandle_t s_capture_mutex = nullptr;
 static SemaphoreHandle_t s_capture_sem = nullptr;
 static SemaphoreHandle_t s_capture_wake_sem = nullptr;
+static SemaphoreHandle_t s_infer_wake_sem = nullptr;
 static int s_ready_idx = -1;
 static int s_busy_idx = -1;
 static size_t s_ready_len = 0;
@@ -582,29 +591,51 @@ static bool s_have_result = false;
 static std::atomic<const char*> s_system_phase{"STANDBY"};
 static std::atomic<bool> s_camera_res_dirty{true};
 
+struct CaptureLease {
+    uint32_t token = 0;
+    bool active = false;
+    void release() {
+        if (!active) return;
+        active = false;
+        xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+        s_gate.finishCapture(token);
+        const bool canSleep = s_gate.canSleep();
+        xSemaphoreGive(s_capture_mutex);
+        if (canSleep) {
+            edgeNotifyControl();
+        }
+    }
+    ~CaptureLease() { release(); }
+};
+
 struct InferenceLease {
     uint32_t token;
     ~InferenceLease() {
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
         s_busy_idx = -1;
         s_gate.finishInference(token);
+        const bool canSleep = s_gate.canSleep();
         xSemaphoreGive(s_capture_mutex);
+        if (canSleep) {
+            edgeNotifyControl();
+        }
     }
 };
 
 static void requestCapture(bool active, uint32_t scaleSession) {
-    bool woke = false;
+    bool changed = false;
     xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
     if (s_gate.request(active, scaleSession)) {
         s_ready_idx = -1;
         s_consecutive_failures = 0;
         while (xSemaphoreTake(s_capture_sem, 0) == pdTRUE) {}
-        woke = active;
+        changed = true;
     }
     s_requested_scale_session = scaleSession;
     xSemaphoreGive(s_capture_mutex);
-    if (woke && s_capture_wake_sem) {
-        xSemaphoreGive(s_capture_wake_sem);
+    if (changed) {
+        if (s_capture_wake_sem) xSemaphoreGive(s_capture_wake_sem);
+        if (active && s_infer_wake_sem) xSemaphoreGive(s_infer_wake_sem);
     }
 }
 
@@ -612,6 +643,7 @@ static void integrationControlTask(void* arg) {
     bool requested = false, holding = false;
     uint32_t session = 0, holdAt = 0, lastReportAt = 0, lastGeneration = UINT32_MAX;
     const char* lastPhase = nullptr;
+    float lastBleDuty = -1.0f;
     while (true) {
 #ifdef EDGE_CAMERA_CONTINUOUS
         const bool active = true;
@@ -621,6 +653,7 @@ static void integrationControlTask(void* arg) {
         const bool active = sample.present();
         const uint32_t wantedSession = sample.sessionId;
 #endif
+        const uint32_t holdMs = static_cast<uint32_t>(configSnapshot().holdSec) * 1000U;
         if (active && (!requested || wantedSession != session)) {
             lcdHoldResult(nullptr);
             setPowerMode(true);
@@ -649,21 +682,24 @@ static void integrationControlTask(void* arg) {
             xSemaphoreGive(s_capture_mutex);
             // Both workers must release their buffers/HTTP handles before DFS.
             if (idle && powerModeActive()) {
-                setPowerMode(false);
-                cameraState(PersonStatus::None);
-                if (hasResult) {
+                if (hasResult && holdMs > 0) {
                     lcdHoldResult(&result);
-                    lcdSetBacklight(true);
+                    setPowerMode(false, /*keepLcdOn=*/true);
+                    cameraState(PersonStatus::None);
                     holding = true;
                     holdAt = clockMs();
                     s_system_phase.store("RESULT_HOLD");
                 } else {
+                    lcdHoldResult(nullptr);
+                    setPowerMode(false, /*keepLcdOn=*/false);
+                    cameraState(PersonStatus::None);
+                    holding = false;
                     s_system_phase.store("STANDBY");
                 }
             }
-            if (holding && clockMs() - holdAt >= 10000) {
+            if (holding && (holdMs == 0 || clockMs() - holdAt >= holdMs)) {
+                lcdSetBacklight(false);
                 lcdHoldResult(nullptr);
-                lcdSetBacklight(true);
                 holding = false;
                 s_system_phase.store("STANDBY");
             }
@@ -674,21 +710,45 @@ static void integrationControlTask(void* arg) {
         xSemaphoreGive(s_capture_mutex);
         const char* phase = s_system_phase.load();
         const uint32_t now = clockMs();
-        if (phase != lastPhase || generation != lastGeneration || now - lastReportAt >= 1000) {
+        const bool usbConn = usbConnected();
+        const float bleDuty = bleScanDutyPercent();
+        if (phase != lastPhase || generation != lastGeneration ||
+            (usbConn && (std::fabs(bleDuty - lastBleDuty) >= 0.05f ||
+                         now - lastReportAt >= kControlReportIntervalMs))) {
             powerTelemetry(phase, generation, holding ? &heldResult : nullptr);
             lastReportAt = now;
             lastPhase = phase;
             lastGeneration = generation;
+            lastBleDuty = bleDuty;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        const uint32_t waitMs = computeControlWaitMs({
+            now, lastReportAt, holdAt, holdMs,
+            active, powerModeActive(), holding, usbConn
+        });
+        if (waitMs > 0) {
+            edgeWaitControl(waitMs);
+        }
     }
 }
 
 static void captureWorkerTask(void* arg) {
-    static HttpCaptureClient httpClient;
+    auto* httpClientMem = heap_caps_calloc(1, sizeof(HttpCaptureClient), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    auto* httpClientPtr = httpClientMem ? new (httpClientMem) HttpCaptureClient() : new HttpCaptureClient();
+    auto& httpClient = *httpClientPtr;
     static uint32_t last_res_attempt_ms = 0;
     static char last_res_url[160] = {};
+    static uint32_t last_wifi_epoch = 0;
     while (true) {
+        xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
+        const bool enabled = s_gate.enabled();
+        xSemaphoreGive(s_capture_mutex);
+
+        if (!enabled) {
+            httpClient.reset();
+            xSemaphoreTake(s_capture_wake_sem, portMAX_DELAY);
+            continue;
+        }
+
         if (!wifiReady()) {
             httpClient.reset();
             s_camera_res_dirty.store(true);
@@ -698,29 +758,34 @@ static void captureWorkerTask(void* arg) {
             s_ready_len = 0;
             s_consecutive_failures = 0;
             xSemaphoreGive(s_capture_mutex);
-            vTaskDelay(pdMS_TO_TICKS(200));
+            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(200));
             continue;
+        }
+
+        const uint32_t wifiEpoch = wifiConnectEpoch();
+        if (wifiEpoch != last_wifi_epoch) {
+            last_wifi_epoch = wifiEpoch;
+            httpClient.reset();
+            s_camera_res_dirty.store(true);
+            last_res_attempt_ms = 0;
         }
 
         int write_idx = -1;
         uint32_t token = 0;
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
-        const bool enabled = s_gate.enabled();
-        if (s_ready_idx == -1 && s_gate.beginCapture(token)) {
+        if (s_gate.enabled() && wifiReady() && s_ready_idx == -1 && s_gate.beginCapture(token)) {
             write_idx = (s_busy_idx == 0) ? 1 : 0;
         }
         xSemaphoreGive(s_capture_mutex);
 
         if (write_idx < 0) {
-            if (!enabled) {
-                httpClient.reset();
-            }
-            // Wait on wake semaphore so stepping on the scale triggers HTTP
-            // capture immediately (0 ms) instead of sleeping through a poll tick.
-            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(enabled ? 15 : 100));
+            // Wait on wake semaphore so stepping on the scale or consuming a
+            // ready frame triggers HTTP capture immediately (0 ms).
+            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(15));
             continue;
         }
 
+        CaptureLease captureLease{token, true};
         const auto cfg = configSnapshot();
         if (kCameraTargetFramesize >= 0) {
             if (strcmp(last_res_url, cfg.cameraUrl) != 0) {
@@ -734,11 +799,14 @@ static void captureWorkerTask(void* arg) {
                 (last_res_attempt_ms == 0 || nowMs - last_res_attempt_ms >= 10000)) {
                 last_res_attempt_ms = nowMs;
                 const bool applied = httpClient.applyCameraFramesize(cfg.cameraUrl, kCameraTargetFramesize);
-                s_camera_res_dirty.store(false);
                 if (applied) {
+                    s_camera_res_dirty.store(false);
                     ESP_LOGI(TAG, "Camera framesize set to %d (max %d px)",
                              kCameraTargetFramesize, cameraTargetMaxWidth(kCameraTargetFramesize));
                     vTaskDelay(pdMS_TO_TICKS(120));
+                } else {
+                    ESP_LOGW(TAG, "Failed to set camera framesize %d; will retry in 10 s",
+                             kCameraTargetFramesize);
                 }
             }
         }
@@ -749,8 +817,13 @@ static void captureWorkerTask(void* arg) {
 
         xSemaphoreTake(s_capture_mutex, portMAX_DELAY);
         const bool accepted = s_gate.finishCapture(token);
+        captureLease.active = false;
         if (!accepted) {
+            const bool canSleep = s_gate.canSleep();
             xSemaphoreGive(s_capture_mutex);
+            if (canSleep) {
+                edgeNotifyControl();
+            }
             continue;
         }
         if (length > 0) {
@@ -764,7 +837,7 @@ static void captureWorkerTask(void* arg) {
             // Adaptive breather: hidden behind Core 1 inference when fast,
             // backs off up to 900 ms when OhStem/Wi-Fi is congested.
             const uint32_t breather_ms = std::clamp<uint32_t>(elapsed / 2, 150, 900);
-            vTaskDelay(pdMS_TO_TICKS(breather_ms));
+            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(breather_ms));
         } else {
             ++s_consecutive_failures;
             s_last_error = err;
@@ -773,13 +846,261 @@ static void captureWorkerTask(void* arg) {
             if (fails >= 3) {
                 xSemaphoreGive(s_capture_sem);
             }
-            // Gentle retry backoff so a busy camera is not dogpiled.
+            // Gentle retry backoff so a busy camera is not dogpiled; wake early on session changes.
             const uint32_t retry_ms = (fails == 1) ? 400 : (fails == 2) ? 1000 :
                                       std::min<uint32_t>(3500, 1200 + fails * 500);
-            vTaskDelay(pdMS_TO_TICKS(retry_ms));
+            xSemaphoreTake(s_capture_wake_sem, pdMS_TO_TICKS(retry_ms));
         }
     }
 }
+
+#ifdef EDGE_SERVO_TEST
+static QueueHandle_t s_servo_cmd_queue = nullptr;
+
+static void servoTestUsbLine(const char* line) {
+    if (!line || !s_servo_cmd_queue) return;
+    char msg[64] = {};
+    strncpy(msg, line, sizeof(msg) - 1);
+    xQueueSend(s_servo_cmd_queue, msg, 0);
+}
+
+static void servoTestLog(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(buf, sizeof(buf) - 3, fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+    size_t len = static_cast<size_t>(std::min<int>(n, static_cast<int>(sizeof(buf) - 3)));
+    ESP_LOGI(TAG, "%s", buf);
+    buf[len++] = '\r';
+    buf[len++] = '\n';
+    buf[len] = '\0';
+    usbWriteText(buf);
+}
+
+static bool equalsIgnoreCase(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) !=
+            std::tolower(static_cast<unsigned char>(*b))) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static bool startsWithIgnoreCase(const char* text, const char* prefix) {
+    if (!text || !prefix) return false;
+    while (*prefix) {
+        if (!*text || std::tolower(static_cast<unsigned char>(*text)) !=
+                      std::tolower(static_cast<unsigned char>(*prefix))) {
+            return false;
+        }
+        ++text;
+        ++prefix;
+    }
+    return true;
+}
+
+static void trimCommand(char* text) {
+    if (!text) return;
+    size_t start = 0;
+    while (text[start] && std::isspace(static_cast<unsigned char>(text[start]))) ++start;
+    size_t len = strlen(text + start);
+    if (start > 0) memmove(text, text + start, len + 1);
+    while (len > 0 && std::isspace(static_cast<unsigned char>(text[len - 1]))) {
+        text[--len] = '\0';
+    }
+}
+
+static void servoTestUpdateLcd(const EdgeConfig& cfg, float deg, bool ready, bool attached) {
+    char l0[17], l1[17];
+    if (!ready) {
+        snprintf(l0, sizeof(l0), "Servo DISABLED");
+        snprintf(l1, sizeof(l1), "Pin:%d", static_cast<int>(cfg.servoPin));
+    } else {
+        snprintf(l0, sizeof(l0), "Srv:%5.1f %s", deg, attached ? "ON" : "OFF");
+        snprintf(l1, sizeof(l1), "Tilt:%+5.1f deg", servoToTiltDeg(deg, cfg));
+    }
+    lcdMessage(l0, l1);
+}
+
+static void servoTestPrintStatus(const EdgeConfig& cfg) {
+    const bool ready = servoIsInitialized();
+    const bool attached = servoIsAttached();
+    const float cur = servoCurrentDeg();
+    servoTestLog("[SERVO] pin=%d ready=%d attached=%d cur=%.1f deg tilt=%+.1f deg "
+                 "limits=[%.1f..%.1f] sweep=[%.1f..%.1f step=%.1f] level=%.1f dir=%d settle=%ums",
+                 static_cast<int>(cfg.servoPin), ready ? 1 : 0, attached ? 1 : 0,
+                 cur, servoToTiltDeg(cur, cfg),
+                 cfg.servoMinDeg, cfg.servoMaxDeg,
+                 cfg.servoBottomDeg, cfg.servoTopDeg, cfg.servoStepDeg,
+                 cfg.servoLevelDeg, static_cast<int>(cfg.servoDir),
+                 static_cast<unsigned>(cfg.servoSettleMs));
+}
+
+static void servoTestPrintHelp() {
+    servoTestLog("[SERVO HELP] Commands: SERVO <deg> | SERVO BOTTOM | SERVO TOP | "
+                 "SERVO LEVEL | SERVO SWEEP | SERVO DETACH | SERVO STATUS | HELP");
+}
+
+static bool servoTestMoveAndReport(const EdgeConfig& cfg, const char* label, float targetDeg) {
+    if (!servoIsInitialized()) {
+        servoTestLog("[SERVO] Cannot move%s%s: servo disabled (pin=-1)",
+                     label ? " to " : "", label ? label : "");
+        servoTestUpdateLcd(cfg, servoCurrentDeg(), false, false);
+        return false;
+    }
+    servoMoveDeg(targetDeg, cfg.servoSettleMs);
+    const float cur = servoCurrentDeg();
+    const bool attached = servoIsAttached();
+    if (!attached) {
+        servoTestLog("[SERVO] Move%s%s to %.1f deg FAILED (LEDC PWM error)",
+                     label ? " " : "", label ? label : "", targetDeg);
+    } else if (label) {
+        servoTestLog("[SERVO] Moved to %s %.1f deg (tilt=%+.1f deg)",
+                     label, cur, servoToTiltDeg(cur, cfg));
+    } else {
+        servoTestLog("[SERVO] Moved to %.1f deg (tilt=%+.1f deg)",
+                     cur, servoToTiltDeg(cur, cfg));
+    }
+    servoTestUpdateLcd(cfg, cur, true, attached);
+    return attached;
+}
+
+static void runServoTestBench() {
+    s_servo_cmd_queue = xQueueCreate(8, 64);
+    ESP_ERROR_CHECK(s_servo_cmd_queue ? ESP_OK : ESP_ERR_NO_MEM);
+    lcdSetBacklight(true);
+
+    EdgeConfig cfg = configSnapshot();
+    uint32_t lastRev = cfg.revision;
+    servoInitFromConfig(cfg);
+    setUsbLineHandler(servoTestUsbLine);
+
+    servoTestPrintHelp();
+    servoTestPrintStatus(cfg);
+    servoTestUpdateLcd(cfg, servoCurrentDeg(), servoIsInitialized(), servoIsAttached());
+
+    char cmd[64];
+    while (true) {
+        const bool gotCmd = (xQueueReceive(s_servo_cmd_queue, cmd, pdMS_TO_TICKS(1500)) == pdTRUE);
+        const EdgeConfig latest = configSnapshot();
+        if (latest.revision != lastRev) {
+            lastRev = latest.revision;
+            cfg = latest;
+            servoInitFromConfig(cfg);
+            servoTestLog("[SERVO] Config updated (rev=%lu)", static_cast<unsigned long>(lastRev));
+            servoTestPrintStatus(cfg);
+            servoTestUpdateLcd(cfg, servoCurrentDeg(), servoIsInitialized(), servoIsAttached());
+        }
+        if (!gotCmd) {
+            servoTestUpdateLcd(cfg, servoCurrentDeg(), servoIsInitialized(), servoIsAttached());
+            continue;
+        }
+        trimCommand(cmd);
+        if (!cmd[0]) continue;
+
+        if (equalsIgnoreCase(cmd, "HELP") || strcmp(cmd, "?") == 0) {
+            servoTestPrintHelp();
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO STATUS") || equalsIgnoreCase(cmd, "STATUS")) {
+            servoTestPrintStatus(cfg);
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO DETACH") || equalsIgnoreCase(cmd, "DETACH")) {
+            servoDetach();
+            servoTestLog("[SERVO] Detached PWM output");
+            servoTestUpdateLcd(cfg, servoCurrentDeg(), servoIsInitialized(), false);
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO BOTTOM") || equalsIgnoreCase(cmd, "BOTTOM")) {
+            servoTestMoveAndReport(cfg, "BOTTOM", cfg.servoBottomDeg);
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO TOP") || equalsIgnoreCase(cmd, "TOP")) {
+            servoTestMoveAndReport(cfg, "TOP", cfg.servoTopDeg);
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO LEVEL") || equalsIgnoreCase(cmd, "LEVEL")) {
+            servoTestMoveAndReport(cfg, "LEVEL", cfg.servoLevelDeg);
+            continue;
+        }
+        if (equalsIgnoreCase(cmd, "SERVO SWEEP") || equalsIgnoreCase(cmd, "SWEEP")) {
+            if (!servoIsInitialized()) {
+                servoTestLog("[SERVO] Cannot sweep: servo disabled (pin=-1)");
+                continue;
+            }
+            servoTestLog("[SERVO] Sweep start: %.1f -> %.1f (step %.1f, settle %ums)",
+                         cfg.servoBottomDeg, cfg.servoTopDeg, cfg.servoStepDeg,
+                         static_cast<unsigned>(cfg.servoSettleMs));
+            servoMoveDeg(cfg.servoBottomDeg, cfg.servoSettleMs);
+            if (!servoIsAttached()) {
+                servoTestLog("[SERVO] Sweep aborted: LEDC PWM error at %.1f deg", cfg.servoBottomDeg);
+                servoTestUpdateLcd(cfg, servoCurrentDeg(), true, false);
+                continue;
+            }
+            float cur = servoCurrentDeg();
+            servoTestLog("[SERVO] Step %.1f deg (tilt=%+.1f deg)", cur, servoToTiltDeg(cur, cfg));
+            servoTestUpdateLcd(cfg, cur, true, true);
+
+            float nextDeg = cur;
+            bool aborted = false;
+            bool hwError = false;
+            while (servoNextSweepDeg(cur, cfg.servoBottomDeg, cfg.servoTopDeg, cfg.servoStepDeg, nextDeg)) {
+                if (uxQueueMessagesWaiting(s_servo_cmd_queue) > 0) {
+                    aborted = true;
+                    break;
+                }
+                servoMoveDeg(nextDeg, cfg.servoSettleMs);
+                if (!servoIsAttached()) {
+                    hwError = true;
+                    servoTestLog("[SERVO] Sweep aborted: LEDC PWM error at %.1f deg", nextDeg);
+                    servoTestUpdateLcd(cfg, servoCurrentDeg(), true, false);
+                    break;
+                }
+                cur = servoCurrentDeg();
+                servoTestLog("[SERVO] Step %.1f deg (tilt=%+.1f deg)", cur, servoToTiltDeg(cur, cfg));
+                servoTestUpdateLcd(cfg, cur, true, true);
+            }
+            if (!hwError) {
+                servoTestLog(aborted ? "[SERVO] Sweep aborted by new command" : "[SERVO] Sweep complete");
+            }
+            continue;
+        }
+
+        const char* arg = nullptr;
+        if (startsWithIgnoreCase(cmd, "SERVO ")) {
+            arg = cmd + 6;
+            while (*arg && std::isspace(static_cast<unsigned char>(*arg))) ++arg;
+        }
+        if (arg && *arg) {
+            char* end = nullptr;
+            const float reqDeg = strtof(arg, &end);
+            while (end && *end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+            if (end != arg && end && *end == '\0' && std::isfinite(reqDeg)) {
+                if (!servoIsInitialized()) {
+                    servoTestLog("[SERVO] Cannot move: servo disabled (pin=-1)");
+                    servoTestUpdateLcd(cfg, servoCurrentDeg(), false, false);
+                    continue;
+                }
+                const float clamped = clampServoDeg(reqDeg, cfg.servoMinDeg, cfg.servoMaxDeg);
+                if (std::fabs(clamped - reqDeg) > 0.05f) {
+                    servoTestLog("[SERVO] Requested %.1f deg clamped to safety range [%.1f..%.1f]",
+                                 reqDeg, cfg.servoMinDeg, cfg.servoMaxDeg);
+                }
+                servoTestMoveAndReport(cfg, nullptr, clamped);
+                continue;
+            }
+        }
+        servoTestLog("[SERVO] Unknown command '%s'. Send HELP for usage.", cmd);
+    }
+}
+#endif
 
 extern "C" void app_main() {
     edgeIoInit();
@@ -787,24 +1108,39 @@ extern "C" void app_main() {
     setPowerMode(false);
     uint32_t lastReportAt = 0;
     bool firstReport = true;
+    float lastBleDuty = -1.0f;
     while (true) {
         const auto scale = scaleSnapshot();
         const bool active = scale.hasWeight && scale.weightKg > 5.0f;
         const bool changed = active != powerModeActive();
         if (changed) setPowerMode(active);
         const uint32_t now = clockMs();
-        if (firstReport || changed || now - lastReportAt >= 1000) {
+        const bool usbConn = usbConnected();
+        const float bleDuty = bleScanDutyPercent();
+        if (firstReport || changed ||
+            (usbConn && (std::fabs(bleDuty - lastBleDuty) >= 0.05f ||
+                         now - lastReportAt >= kControlReportIntervalMs))) {
             powerTelemetry(active ? "ACTIVE" : "STANDBY", scaleSampleSnapshot().sessionId);
             firstReport = false;
             lastReportAt = now;
+            lastBleDuty = bleDuty;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        const uint32_t waitMs = computeControlWaitMs({
+            now, lastReportAt, 0, 0, active, active, false, usbConn
+        });
+        if (waitMs > 0) {
+            edgeWaitControl(waitMs);
+        }
     }
+#endif
+#ifdef EDGE_SERVO_TEST
+    runServoTestBench();
 #endif
     lcdMessage("Loading YOLO26n", "Please wait");
 
-    // Copy model weights into 8-bit Octal PSRAM (80 MHz DDR) while keeping
-    // internal DMA SRAM free for Wi-Fi, lwIP TCP/IP, HTTP, and task stacks.
+    // Route dl::Model/YOLO26 graph metadata allocations into 8-bit Octal PSRAM
+    // so Wi-Fi/BLE/PHY internal SRAM allocations never starve at boot.
+    heap_caps_malloc_extmem_enable(0);
     auto* model = new dl::Model(reinterpret_cast<const char*>(modelStart),
         fbs::MODEL_LOCATION_IN_FLASH_RODATA, 0, dl::MEMORY_MANAGER_GREEDY, nullptr, true);
     if (!model->is_built()) {
@@ -813,6 +1149,7 @@ extern "C" void app_main() {
             fbs::MODEL_LOCATION_IN_FLASH_RODATA, 0, dl::MEMORY_MANAGER_GREEDY, nullptr, false);
     }
     if (!model->is_built()) {
+        heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
         lcdMessage("Model RAM error", "Check USB viewer");
         while (true) { status("Model allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
@@ -825,12 +1162,14 @@ extern "C" void app_main() {
     const auto warmupAt = clockMs();
     for (const auto& input : model->get_inputs()) {
         if (!input.second || !input.second->data) {
+            heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
             lcdMessage("Model input error", "Check USB viewer");
             while (true) { status("Model input allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); }
         }
         memset(input.second->data, 0, input.second->get_bytes());
     }
     model->run(); // Exercise inference RAM even before WiFi has been provisioned.
+    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
     char boot[224];
     snprintf(boot, sizeof(boot),
         "{\"kind\":\"boot\",\"self_test_ms\":%lu,\"free_psram\":%u,\"free_internal\":%u,\"largest_internal\":%u}",
@@ -840,19 +1179,24 @@ extern "C" void app_main() {
         unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
     usbFrame(nullptr, 0, boot);
 
+    static constexpr size_t kBoxesCapacity = 1600;
+    static constexpr size_t kMetadataCapacity = 3500;
     s_jpeg_buffers[0] = static_cast<uint8_t*>(heap_caps_malloc(JPEG_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     s_jpeg_buffers[1] = static_cast<uint8_t*>(heap_caps_malloc(JPEG_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!s_jpeg_buffers[0] || !s_jpeg_buffers[1]) {
+    auto* boxes = static_cast<char*>(heap_caps_malloc(kBoxesCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    auto* metadata = static_cast<char*>(heap_caps_malloc(kMetadataCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_jpeg_buffers[0] || !s_jpeg_buffers[1] || !boxes || !metadata) {
         lcdMessage("JPEG RAM error", "Check PSRAM");
-        while (true) { status("JPEG allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); }
+        while (true) { status("PSRAM buffer allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     s_capture_mutex = xSemaphoreCreateMutex();
     s_capture_sem = xSemaphoreCreateBinary();
     s_capture_wake_sem = xSemaphoreCreateBinary();
-    ESP_ERROR_CHECK(s_capture_mutex && s_capture_sem && s_capture_wake_sem ? ESP_OK : ESP_ERR_NO_MEM);
+    s_infer_wake_sem = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(s_capture_mutex && s_capture_sem && s_capture_wake_sem && s_infer_wake_sem ? ESP_OK : ESP_ERR_NO_MEM);
     // Pin background HTTP capture to Core 0 (alongside Wi-Fi/lwIP) so Core 1
     // (app_main affinity) runs YOLO26n inference uninterrupted in parallel.
-    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(captureWorkerTask, "cam_cap", 8192, nullptr, 4, nullptr, 0)
+    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(captureWorkerTask, "cam_cap", 6144, nullptr, 4, nullptr, 0)
                     == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(xTaskCreatePinnedToCore(integrationControlTask, "integration", 4096, nullptr, 3, nullptr, 0)
                     == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
@@ -877,7 +1221,7 @@ extern "C" void app_main() {
             calibCollector.reset();
             consecutiveNone = 0;
             hadPerson = false;
-            vTaskDelay(pdMS_TO_TICKS(20));
+            xSemaphoreTake(s_infer_wake_sem, portMAX_DELAY);
             continue;
         }
 
@@ -917,6 +1261,9 @@ extern "C" void app_main() {
             err = s_last_error;
         }
         xSemaphoreGive(s_capture_mutex);
+        if (buf_idx >= 0 && s_capture_wake_sem) {
+            xSemaphoreGive(s_capture_wake_sem);
+        }
 
         const auto cfg = configSnapshot();
         if (cfg.revision != lastConfigRev) {
@@ -1098,29 +1445,28 @@ extern "C" void app_main() {
         }
         xSemaphoreGive(s_capture_mutex);
 
-        char boxes[1600];
         size_t boxPos = 0;
         boxes[boxPos++] = '[';
         const size_t maxBoxes = std::min<size_t>(people.size(), 20);
-        for (size_t i = 0; i < maxBoxes && boxPos + 2 < sizeof(boxes); ++i) {
+        for (size_t i = 0; i < maxBoxes && boxPos + 2 < kBoxesCapacity; ++i) {
             const auto& b = people[i];
-            const int written = snprintf(boxes + boxPos, sizeof(boxes) - boxPos - 1,
+            const int written = snprintf(boxes + boxPos, kBoxesCapacity - boxPos - 1,
                 "%s[%.1f,%.1f,%.1f,%.1f,%.3f]", i ? "," : "", b.x1, b.y1, b.x2, b.y2, b.score);
-            if (written < 0 || boxPos + static_cast<size_t>(written) + 2 > sizeof(boxes)) {
+            if (written < 0 || boxPos + static_cast<size_t>(written) + 2 > kBoxesCapacity) {
                 break;
             }
             boxPos += static_cast<size_t>(written);
         }
         boxes[boxPos++] = ']';
         boxes[boxPos] = '\0';
-        char metadata[3500], weight[32] = "null", bmi[32] = "null", h[32] = "null", d[32] = "null";
+        char weight[32] = "null", bmi[32] = "null", h[32] = "null", d[32] = "null";
         if (view.hasWeight) snprintf(weight, sizeof(weight), "%.2f", view.weightKg);
         if (view.hasBMI) snprintf(bmi, sizeof(bmi), "%.2f", view.bmi);
         if (view.hasHeight) {
             snprintf(h, sizeof(h), "%.1f", view.heightCm);
             snprintf(d, sizeof(d), "%.3f", view.distanceM);
         }
-        snprintf(metadata, sizeof(metadata),
+        snprintf(metadata, kMetadataCapacity,
             "{\"kind\":\"frame\",\"width\":%d,\"height\":%d,\"status\":\"%s\",\"boxes\":%s,"
             "\"height_cm\":%s,\"distance_m\":%s,\"weight_kg\":%s,\"weight_stable\":%s,\"bmi\":%s,\"held\":%s,"
             "\"processing_ms\":%lu,\"capture_ms\":%lu,\"free_psram\":%u,"

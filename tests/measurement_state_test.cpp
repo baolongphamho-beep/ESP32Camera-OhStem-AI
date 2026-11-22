@@ -109,6 +109,23 @@ int main() {
     assert(heldState.view(0x00000100U).held && heldState.view(0x00000100U).hasBMI);
     assert(!heldState.view(0x00004000U).held && !heldState.view(0x00004000U).hasBMI);
 
+    // Dynamic hold duration updates via setHoldMs().
+    heldState.setHoldMs(15000);
+    assert(heldState.holdMs() == 15000);
+    heldState.camera(1000, PersonStatus::Measured, 175, 2.5f);
+    heldState.weight(1100, 70, true);
+    heldState.clearWeight();
+    assert(heldState.view(14500).held && heldState.view(14500).hasBMI);
+    assert(!heldState.view(16101).held && !heldState.view(16101).hasBMI);
+
+    heldState.camera(20000, PersonStatus::Measured, 175, 2.5f);
+    heldState.weight(20100, 70, true);
+    heldState.clearWeight();
+    assert(heldState.view(20200).held);
+    heldState.setHoldMs(0);
+    assert(heldState.holdMs() == 0);
+    assert(!heldState.view(20201).held && !heldState.view(20201).hasBMI);
+
     PersonStatus status;
     float height, distance;
     assert(decodeCameraLabel("MEAS_H180.0_D3.000", status, height, distance));

@@ -57,4 +57,20 @@ int main() {
     scale.update(0xfffffff0U, 20, true);
     assert(scale.snapshot(10).present()); // Millisecond rollover.
     assert(!scale.snapshot(30000).present());
+
+    // Aborting an acquired capture (e.g. Wi-Fi disconnect race) must still allow sleep
+    // and allow subsequent capture cycles once re-enabled.
+    CaptureGate wifiAbortGate;
+    assert(wifiAbortGate.request(true, 10));
+    uint32_t capTok = 0;
+    assert(wifiAbortGate.beginCapture(capTok));
+    assert(!wifiAbortGate.canSleep());
+    wifiAbortGate.request(false, 10);
+    assert(!wifiAbortGate.canSleep()); // Still busy until finishCapture() runs.
+    assert(!wifiAbortGate.finishCapture(capTok));
+    assert(wifiAbortGate.canSleep());
+    assert(wifiAbortGate.request(true, 11));
+    assert(wifiAbortGate.beginCapture(capTok));
+    assert(wifiAbortGate.finishCapture(capTok));
+    assert(!wifiAbortGate.canSleep());
 }
