@@ -115,7 +115,7 @@ public:
     bool cameraTest = false;
     bool servoJog = false;   // USB "SERVO <deg>" calibration lease (servo_jog.h)
     float jogDeg = NAN;
-    const char* testMessage = "Waiting for frame";
+    const char* testMessage = "Waiting frame";
 
     void begin() {
         cfg = configSnapshot(); fsm.setConfig(cfg); fsm.begin(clockMs());
@@ -157,7 +157,7 @@ public:
             servoDetach(); gate.invalidate(); fsm.reset(clockMs());
             bleSetCameraTest(requestedTest);
             held_ = {}; lastCommand_ = NAN; servoOk = true;
-            cameraTest = requestedTest; testMessage = "Waiting for frame";
+            cameraTest = requestedTest; testMessage = "Waiting frame";
         }
         if (cameraTest) {
             // No setScale/update/driveServo: preview cannot wake or move the servo.

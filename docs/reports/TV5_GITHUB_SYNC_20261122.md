@@ -159,3 +159,13 @@ Nguồn: `smartscale-edge-ai@78548a6` (BaoLong/TV2). Chỉ lấy phần mạng/B
 Test PC: thêm `http_capture_parser_test`, `wifi_reconnect_test`, `wifi_credentials_test`, `ble_scan_retry_test` (nguyên bản GitHub) → `tools/run_all_tests.ps1` **18 PASS, 0 FAIL, 0 SKIP**. Build native ESP-IDF 6.1 thành công (app 0x599b20, nhỏ hơn ~87 KB vì bỏ `esp_http_client`). **Chưa nạp, chưa thử với camera thật.**
 
 **Nạp và thử trên bo gốc COM5 (22/11, sau khi ghép):** nạp thành công (tự tìm COM5, app 5.865.472 byte). Khởi động: tự kiểm tra model 313 ms, PSRAM trống 4.999.808 B, RAM nội 75.071 B (giảm ~6 KB do bộ đệm 4 KiB của client socket); `CONFIG?` giữ nguyên Wi-Fi/camera/servo; về `STANDBY`. Preview 20 s: `CAMERA_TEST`, `WiFi not ready`, 27 gói, không treo. **Chưa kiểm được lấy ảnh/nối lại Wi-Fi** vì mạng Wi-Fi đã cấu hình (điểm phát điện thoại) và camera chưa bật lúc thử.
+
+## 15. Thử LCD + YOLO UNO, sửa lỗi hết RAM (22/11)
+
+- **Lỗi:** sau khi ghép phần GitHub, khi Wi-Fi bắt đầu kết nối được, bo khởi động lại liên tục (~2 s/lần) với `ESP_ERR_NO_MEM` ở `ets_timer_setfn`, trước khi gửi gói nào. Nguyên nhân: chưa lấy kèm cấu hình bộ nhớ của `smartscale-edge-ai`.
+- **Sửa:** `sdkconfig.defaults` thêm `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y`, `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512` (trước 16384), Wi-Fi RX 32 / BA 10, LWIP TCP (MSL/FIN 5 s, SO_LINGER, SACK, tcpip CPU0). Cần xóa `sdkconfig` cũ trong thư mục stage để sinh lại.
+- **Kết quả trên bo COM5:** 0 lần reset/15 s, Wi-Fi kết nối, gói trạng thái mỗi giây, bộ lấy ảnh báo `Cannot connect to camera (errno=116)` mỗi ~2,5 s khi camera tắt (không treo). Tự kiểm tra model 312 ms.
+- **LCD (nội dung firmware gửi):** `Aligning cam... / Stand still`, `Camera test / Camera error`, `Waking up... / Please wait`, `Camera error / Check laptop/IP`. Cân vẫn báo có tải nên bo không về STANDBY trong lúc thử. Hiển thị thật trên LCD chờ người dùng xác nhận.
+- **Sửa chữ LCD:** `Waiting for frame` (17 ký tự) bị cắt thành `Waiting for fram`; đổi thành `Waiting frame` (chưa nạp).
+- Branch `feat/ui-viewer-qa`: commit cục bộ `98cde2d` (chưa push lúc ghi).
+- **Người dùng xác nhận LCD 16×2 thật hiển thị đúng** các nội dung trên (22/11). Đây là lần đầu LCD được nghiệm thu trên phần cứng với firmware native Plan 2 (sau bản sửa delay khởi tạo LCD).
