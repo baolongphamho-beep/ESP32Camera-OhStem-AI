@@ -28,6 +28,57 @@
 #endif
 #define CAMERA_BAUD 115200
 
+// ===== Scale supply control (Project 5: YOLO UNO bật/tắt nguồn cân) =====
+// Relay/MOSFET module input on SCALE_POWER_PIN (GPIO number, default GPIO10 = D7).
+// The scale powers on at boot and whenever the camera sees a person or the
+// scale sends weight; it powers off after SCALE_POWER_IDLE_OFF_MS without activity.
+#ifndef SCALE_POWER_ENABLED
+#define SCALE_POWER_ENABLED 0
+#endif
+#ifndef SCALE_POWER_PIN
+#define SCALE_POWER_PIN 10
+#endif
+#ifndef SCALE_POWER_ACTIVE_HIGH
+#define SCALE_POWER_ACTIVE_HIGH 1   // 0 for low-trigger relay modules
+#endif
+#ifndef SCALE_POWER_IDLE_OFF_MS
+#define SCALE_POWER_IDLE_OFF_MS 120000UL
+#endif
+#ifndef SCALE_POWER_MIN_TOGGLE_MS
+#define SCALE_POWER_MIN_TOGGLE_MS 3000UL
+#endif
+// ===== Plan 2 servo sweep (env:yolo_uno_servo_sweep, src/app_main.cpp) =====
+// Camera UART defaults match env:yolo_uno_camera_lcd (camera TX -> GPIO9, RX -> GPIO8,
+// Grove D5/D6). Servo pulse range matches env:yolo_uno_servo_test, so the angles found
+// there during calibration mean the same thing here. The servo pin default (GPIO10,
+// Plan 2 contract) and the sweep/geometry values live in lib/EdgeSweep/edge_config.h
+// and can be changed at runtime with usb_viewer.py --configure / --set (saved in NVS).
+#ifndef SWEEP_CAMERA_RX_PIN
+#define SWEEP_CAMERA_RX_PIN 9
+#endif
+#ifndef SWEEP_CAMERA_TX_PIN
+#define SWEEP_CAMERA_TX_PIN 8
+#endif
+#ifndef SWEEP_CAMERA_UART
+#define SWEEP_CAMERA_UART 1
+#endif
+#ifndef SWEEP_SERVO_PIN
+#define SWEEP_SERVO_PIN 10
+#endif
+#ifndef SWEEP_SERVO_MIN_US
+#define SWEEP_SERVO_MIN_US 500     // Pulse at 0 deg (same as SERVO_TEST_MIN_US).
+#endif
+#ifndef SWEEP_SERVO_MAX_US
+#define SWEEP_SERVO_MAX_US 2400    // Pulse at 180 deg (same as SERVO_TEST_MAX_US).
+#endif
+#if defined(SERVO_SWEEP_MODE) && SCALE_POWER_ENABLED && SCALE_POWER_PIN == SWEEP_SERVO_PIN
+#error "Servo sweep uses GPIO10 for the servo (Plan 2); move SCALE_POWER_PIN or disable scale power"
+#endif
+
+#if SCALE_POWER_ENABLED && SCALE_ENABLE_FORCE
+#error "SCALE_POWER_PIN default GPIO10 is a force-sensor pin; disable force or change the pin"
+#endif
+
 #if CAMERA_ENABLED && (SCALE_ENABLE_QR || SCALE_ENABLE_FORCE)
 #error "Camera uses QR UART2 and force GPIOs: disable QR and force in camera profile"
 #endif

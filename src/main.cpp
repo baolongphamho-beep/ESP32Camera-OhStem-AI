@@ -3,6 +3,8 @@
 #include "config.h"
 #include "camera.h"
 #include "display.h"
+#include "measurements.h"
+#include "scale_power.h"
 
 void TaskLEDControl(void *pvParameters) {
   pinMode(PIN_LED, OUTPUT); // Initialize LED pin
@@ -29,6 +31,7 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println("[BOOT] YOLO UNO started; Serial baud = 115200");
   delay(500); // Allow the LCD/backpack supply to settle as in AI_Vision_camera.ino.
+  initScalePower();
   initDisplay();
   initCamera();
   
@@ -45,12 +48,36 @@ void loop() {
   static uint32_t lastHeartbeat = 0;
   if (millis() - lastHeartbeat >= 5000) {
     lastHeartbeat = millis();
-    Serial.printf("[ALIVE] uptime=%lu s; lcd=%s; scale=%s; free heap=%lu\n",
+    Serial.printf("[ALIVE] uptime=%lu s; lcd=%s; scale=%s; power=%s; free heap=%lu\n",
                 (unsigned long)(millis() / 1000), displayStatus(), scaleServiceStatus(),
+                scalePowerStatus(),
                 (unsigned long)ESP.getFreeHeap());
   }
   pollCamera();
   updateDisplay();
+
+#if SCALE_POWER_ENABLED
+  // Scale supply: someone in front of the camera or a weight packet in the last
+  // 10 s keeps it on; otherwise it switches off after SCALE_POWER_IDLE_OFF_MS.
+  const MeasurementView view = measurementView();
+  updateScalePower(view.status != PersonStatus::None || weightReceivedWithin(10000));
+
+  // USB Serial commands, e.g. "power off" typed in the Serial Monitor.
+  static char line[32];
+  static size_t lineLength = 0;
+  while (Serial.available() > 0) {
+    const char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (lineLength > 0) {
+        line[lineLength] = '\0';
+        handleScalePowerCommand(line);
+        lineLength = 0;
+      }
+    } else if (lineLength < sizeof(line) - 1) {
+      line[lineLength++] = c;
+    }
+  }
+#endif
   delay(10);
 }
 

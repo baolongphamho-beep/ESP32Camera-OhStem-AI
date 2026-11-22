@@ -1,3 +1,7 @@
+> **Máy LAB đã được thiết lập ngày 18/11/2026:** ESP-IDF 6.1 đã cài, native đã full build/nạp UNO COM5 và kiểm tra STANDBY đạt. Tại gốc dự án chạy `powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash`. Script tự đồng bộ sang `C:\esp\SmartScale`; không cần tự sao chép. [Biên bản kiểm chứng](reports/NATIVE_BUILD_FLASH_20261118.md). Các bước cài bên dưới dành cho máy mới.
+
+> Tài liệu nền nhập từ GitHub commit `c2f71b6`. Để dùng bản Plan 2 đã tích hợp trên máy này, ưu tiên [HUONG_DAN_PLAN2.md](HUONG_DAN_PLAN2.md) và [README native](../firmware/edge_yolo/README.md). Những số liệu bo/đường dẫn máy upstream cần đối chiếu lại.
+
 # Hướng Dẫn Toàn Diện: Thiết Lập & Vận Hành SmartScale Trên Laptop Mới
 
 Tài liệu này được biên soạn dành cho **người mới hoàn toàn**, hướng dẫn từng bước để tải mã nguồn, cài đặt công cụ và vận hành thành công toàn bộ hệ thống **SmartScale (Edge AI trên ESP32-S3 + Cân BLE Mi Scale 2 + Camera AI OhStem + Màn hình LCD 16×2)** trên một máy tính cá nhân hoặc laptop mới tinh.
@@ -9,7 +13,7 @@ Tài liệu này được biên soạn dành cho **người mới hoàn toàn**,
 2. [Cài Đặt Các Phần Mềm Cốt Lõi Trên Laptop Mới](#2-cài-đặt-các-phần-mềm-cốt-lõi-trên-laptop-mới)
    - [2.1. Cài đặt Git for Windows](#21-cài-đặt-git-for-windows)
    - [2.2. Cài đặt Python (3.9 - 3.11)](#22-cài-đặt-python-39---311)
-   - [2.3. Cài đặt ESP-IDF Offline Installer (v5.5.x)](#23-cài-đặt-esp-idf-offline-installer-v55x)
+   - [2.3. Cài ESP-IDF cho firmware native Plan 2](#23-cài-esp-idf-cho-firmware-native-plan-2)
 3. [Tải Mã Nguồn Dự Án (Clone Git)](#3-tải-mã-nguồn-dự-án-clone-git)
 4. [Thiết Lập Môi Trường Python & Chạy Kiểm Thử](#4-thiết-lập-môi-trường-python--chạy-kiểm-thử)
 5. [Sơ Đồ Đấu Nối Phần Cứng](#5-sơ-đồ-đấu-nối-phần-cứng)
@@ -66,20 +70,16 @@ Tài liệu này được biên soạn dành cho **người mới hoàn toàn**,
 
 ---
 
-### 2.3. Cài đặt ESP-IDF Offline Installer (v5.5.x)
-Đây là bộ công cụ biên dịch mã nguồn C++ (GCC Compiler, CMake, Ninja, ESP-IDF SDK) cho chip ESP32-S3.
+### 2.3. Cài ESP-IDF cho firmware native Plan 2
 
-1. Tải bản **ESP-IDF v5.5.x Offline Installer** từ Espressif:
-   - Link tải trực tiếp: [https://dl.espressif.com/dl/esp-idf/](https://dl.espressif.com/dl/esp-idf/) (chọn file `esp-idf-tools-setup-offline-5.5.x.exe`).
-2. Mở trình cài đặt và làm theo hướng dẫn:
-   - **Màn hình Version:** Chọn `v5.5.6 (release version - .zip archive download)` hoặc bản v5.5 tương đương.
-   - **Màn hình chọn thư mục (Directory):**
-     - Mặc định chọn `C:\Espressif` hoặc `D:\Workspace\Espressif`.
-     - *Lưu ý:* Nếu hiện cảnh báo *"Directory already exists and is not empty"*, bạn hãy chọn một thư mục trống mới hoặc xóa thư mục cũ bị gián đoạn trước đó.
-   - **Màn hình Select Components (Chọn thành phần):**
-     - Chọn **Full installation** hoặc giữ nguyên các mục mặc định.
-     - *Mẹo tiết kiệm dung lượng:* Bạn có thể **bỏ chọn** các mục không dùng tới như *Espressif-IDE*, *Rust language support*, *Amazon Corretto JDK*. Chỉ cần giữ lại **Frameworks** và các công cụ Python/GCC.
-   - Nhấn **Install** và chờ thanh tiến trình chạy hoàn tất 100%.
+`pip install -r requirements.txt` chỉ chuẩn bị Python cho YOLO/viewer, không cài SDK để biên dịch firmware. Firmware `firmware/edge_yolo` cần ESP-IDF và toolchain riêng; `build.ps1` không tự cài SDK.
+
+1. Cài **Espressif Installation Manager (EIM)** theo [hướng dẫn Windows chính thức cho ESP32-S3](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/windows-setup.html).
+2. Dùng **Custom Installation**, chọn **ESP-IDF v6.1** để khớp baseline dự án, cùng công cụ cho **ESP32-S3**. Chọn đường dẫn cài ngắn, không dấu cách.
+3. Khi cài xong, mở **Open IDF Terminal** trong dashboard EIM, chạy `idf.py --version` để xác nhận. Python `.venv` của ứng dụng không thay cho môi trường IDF này.
+4. Ghi lại thư mục SDK có `tools/idf.py` và `export.ps1`, dùng cho tham số `-IDFPath`. Ví dụ `C:\Espressif\v6.1\esp-idf` chỉ là minh họa; thay bằng vị trí cài thật.
+
+**Đường dẫn dự án:** [ESP-IDF không hỗ trợ dấu cách trong đường dẫn SDK hoặc dự án](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/windows-start-project.html#start-a-project). Thư mục OneDrive hiện tại chứa `Mira's Laptop`, script `build.ps1` tự tạo/cập nhật bản sao build ở `C:\esp\SmartScale` (đổi bằng `-BuildRoot` nếu cần). Chạy lệnh tại bản gốc trong LAB; tiếp tục chỉnh sửa tại đây. Đổi riêng `-IDFPath` không giải quyết dấu cách trong đường dẫn dự án.
 
 ---
 
@@ -125,7 +125,7 @@ Kiểm tra xem toàn bộ thuật toán hình học tính chiều cao, bộ gi�
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
-**Kết quả mong đợi:** Toàn bộ 29 tests đều hiện `ok` (`Ran 29 tests ... OK`).
+**Kết quả mong đợi:** Toàn bộ 15 tests đều hiện `ok` (`Ran 15 tests ... OK`).
 
 ---
 
@@ -196,25 +196,34 @@ Trước khi cấp điện, hãy nối dây các module theo sơ đồ chuẩn d
 
 ## 6. (Làm Song Song) Biên Dịch & Nạp Firmware Xuống Bo Mạch YOLO UNO
 
-Dự án đã tích hợp sẵn mô hình lượng tử hóa **`yolo26n_224_s8_s3.espdl`** trực tiếp trong Git, và script `build.ps1` sẽ **tự động tải thư viện `esp-dl`** cũng như cập nhật đường dẫn `dependencies.lock` trong lần đầu chạy trên PC mới.
+Dùng bản native Plan 2 sau khi hoàn thành mục 2.3. Model `yolo26n_224_s8_s3.espdl` có trên máy đang làm việc nhưng được gitignore; máy mới chạy `fetch_model.ps1`. ESP-DL được chuẩn bị bằng `prepare_sources.ps1`. `build.ps1` kiểm tra SDK/model, tự đồng bộ nguồn sang đường dẫn build không dấu cách và tải ESP-DL pinned nếu thiếu; không tự cài SDK hoặc xóa cấu hình người dùng.
 
 ### Bước 6.1: Xác định cổng COM của bo mạch YOLO UNO
 1. Cắm cáp USB Type-C từ bo YOLO UNO vào laptop.
 2. Mở **Device Manager** trên Windows (nhấn `Win + X` $\rightarrow$ chọn `Device Manager`).
 3. Mở rộng mục **Ports (COM & LPT)**, tìm số cổng COM của YOLO UNO (ví dụ `USB Serial Device (COM13)` hoặc `COM9`).
 
-### Bước 6.2: Chạy script tự động biên dịch và nạp (1 chạm)
-Mở PowerShell tại thư mục dự án và chạy:
+### Bước 6.2: Chuẩn bị thư viện và build trước khi nạp
+
+Mở PowerShell tại gốc dự án LAB. Script tự đồng bộ các file cần build sang thư mục không dấu cách. Ví dụ dưới giả sử đã cài SDK tại `C:\Espressif\v6.1\esp-idf`; thay bằng đường dẫn cài thật:
 
 ```powershell
-# Thay COM13 bằng cổng COM thực tế trên máy bạn
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM13
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/tools/fetch_model.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -IDFPath "C:\Espressif\v6.1\esp-idf"
 ```
 
-> [!NOTE]
-> - Script `build.ps1` tự động tìm bộ cài đặt ESP-IDF tại `C:\Espressif` hoặc `D:\Workspace\Espressif` và tự tải `.edge-deps/esp-dl` nếu máy mới chưa có.
-> - Quá trình biên dịch lần đầu tiên mất khoảng 2 - 4 phút.
-> - Sau khi biên dịch xong, script tự động nạp bootloader, bảng phân vùng và firmware chứa model AI xuống bo.
+Nếu gặp `ESP-IDF SDK not found`, chưa đến bước nạp hay mở cổng COM: cài SDK hoặc sửa `-IDFPath`. Cài thêm thư viện pip không sửa lỗi này. Máy LAB đã full build/link native bằng ESP-IDF 6.1; máy mới vẫn phải cài SDK trước.
+
+### Bước 6.3: Nạp sau khi build thành công
+
+Xác nhận bo phù hợp partition flash 16 MB của native; đóng Serial Monitor/viewer đang dùng cổng COM. Sau đó chạy:
+
+```powershell
+# Thay đường dẫn SDK bằng thông tin thực tế. Cổng COM được tự tìm; nhiều bo thì thêm -Port COMx.
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -IDFPath "C:\Espressif\v6.1\esp-idf" -Flash
+```
+
+Lệnh này nạp bootloader, partition và app lên **YOLO UNO**. Camera OhStem giữ firmware gốc.
 
 ---
 
@@ -226,20 +235,18 @@ Sau khi đã có IP trên màn hình Camera AI (Mục 5.2) và nạp xong firmwa
 Vẫn giữ cáp USB nối với máy tính, kích hoạt môi trường `.venv` và chạy lệnh:
 
 ```powershell
-python camera/usb_viewer.py --port COM13 --configure
+python camera/usb_viewer.py --configure
 ```
-*(Thay `COM13` bằng cổng COM của bạn).*
+*(Cổng được tự tìm; nếu báo nhiều bo hoặc không thấy bo, thêm `--port COMx` theo Device Manager).*
 
 ### Bước 7.2: Nhập thông số mạng & lắp đặt
 Chương trình sẽ hỏi tương tác từng mục:
 1. **WiFi SSID:** Nhập tên mạng Wi-Fi 2.4GHz (cùng mạng với Camera AI, ví dụ `HCMUT-MEETING`).
 2. **WiFi password:** Nhập mật khẩu Wi-Fi.
 3. **URL hoặc IP camera:** Nhập địa chỉ IP hiện trên màn hình OLED của Camera AI (ví dụ gõ `10.127.7.68` hoặc `http://10.127.7.68/capture` — chương trình sẽ tự động thêm `/capture`).
-4. **MAC cân Mi Scale 2:** Nhập địa chỉ MAC của cân (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` để tắt lọc MAC, hoặc nhấn `Enter` để giữ nguyên).
-5. **Chế độ `fixed` / `ground`:**
-   - Chọn `fixed` (mặc định): Nhập khoảng cách từ camera đến vị trí đứng trên cân (m), chiều cao thật của người chuẩn đầu tiên (cm), và nhập `fy/H = 0` để mạch tự hiệu chuẩn tiêu cự sau 3 khung hình toàn thân liên tiếp ổn định (độ lệch ≤ 5%).
+4. **Chế độ `fixed` / `ground`:**
+   - Chọn `fixed` (mặc định): Nhập khoảng cách từ camera đến vị trí đứng trên cân (m), chiều cao thật của người chuẩn đầu tiên (cm), và nhập `fy/H = 0` để mạch tự hiệu chuẩn tiêu cự ngay khung hình toàn thân đầu tiên.
    - Hoặc chọn `ground`: Nhập độ cao tâm camera so với mặt bàn cân (cm), góc nghiêng xuống (độ) và hệ số tiêu cự `fy/H`.
-6. **Thời gian giữ kết quả LCD (`hold_sec`):** Nhập số giây giữ kết quả trên LCD sau khi bước xuống khỏi cân (dải `0..60`, `0 = tắt giữ`, mặc định **`10`** giây).
 
 > [!TIP]
 > Ngay khi hiện **`Da luu cau hinh.`**, toàn bộ thông số được lưu vĩnh viễn vào bộ nhớ **NVS Flash** của YOLO UNO và cửa sổ xem ảnh trực tiếp sẽ mở ra ngay lập tức!
@@ -247,7 +254,7 @@ Chương trình sẽ hỏi tương tác từng mục:
 ### Bước 7.3: Chạy chương trình ở các lần tiếp theo
 Ở những lần sử dụng sau (khi không đổi Wi-Fi hay IP camera), bạn không cần gõ `--configure` nữa mà chỉ cần chạy thẳng:
 ```powershell
-python camera/usb_viewer.py --port COM13
+python camera/usb_viewer.py
 ```
 Cửa sổ **SmartScale - YOLO UNO USB viewer** sẽ hiển thị trực tiếp video từ camera, khung xanh nhận diện người, chiều cao, khoảng cách, cân nặng, BMI và thời gian xử lý (`AI: ... ms   Net: ... ms`). Nhấn **`Q`** hoặc **`Esc`** khi muốn thoát.
 
@@ -258,15 +265,20 @@ Cửa sổ **SmartScale - YOLO UNO USB viewer** sẽ hiển thị trực tiếp 
 Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toàn cáp kết nối với laptop**:
 
 1. Cấp nguồn 5V cho bo YOLO UNO bằng củ sạc hoặc pin dự phòng.
-2. Khi không có người trên cân (`STANDBY`): hệ thống tự hạ CPU về 80 MHz, tạm dừng camera/AI và **tắt đèn nền màn hình LCD** để tiết kiệm điện, chỉ giữ quét BLE chu kỳ thấp (10%).
-3. Người dùng bước lên cân **Mi Scale 2** (`> 5 kg`) và đứng vào khung hình camera:
-   - Bo mạch YOLO UNO thức dậy tức thời (`< 1 s`), bật sáng đèn nền LCD, tăng CPU lên 240 MHz, nhận ảnh QVGA từ camera qua Wi-Fi (Core 0), chạy mô hình YOLO26n INT8 trên chip (Core 1) và làm mượt chiều cao theo trung vị 5 khung hình.
-   - Đồng thời YOLO UNO nhận gói quảng bá BLE `0x181D` từ cân Mi Scale 2 (lọc theo địa chỉ MAC đã cấu hình).
-   - Màn hình LCD luân phiên mỗi 2,5 giây giữa:
-     - Trang 1: `H:172.0cm` / `W:65.40kg ...` (khi đang cân) hoặc `W:65.40kg LOCK` (khi cân đã chốt ổn định)
-     - Trang 2: `D:2.50m` / `BMI:22.11` (chỉ tính BMI khi đã có chiều cao hợp lệ và cân nặng đã `LOCK`)
-4. Bước xuống khỏi cân để đọc kết quả:
-   - Khi đã có đầy đủ H, W `LOCK` và BMI, màn hình LCD tiếp tục sáng liền mạch và giữ kết quả trong **`10` giây** mặc định (cấu hình được `0..60s` qua `hold_sec`: `D:2.50m HOLD` / `BMI:22.11`) để người đo kịp bước xuống xem trước khi tắt đèn nền về `STANDBY` (hoặc chuyển sang lượt đo mới ngay khi có người khác bước lên cân).
+2. Bật màn hình LCD. Lúc này màn hình sẽ hiện:
+   ```text
+   SmartScale Ready
+   Step on scale...
+   ```
+3. Người dùng đứng lên cân **Mi Scale 2**:
+   - Màn hình cân LED sáng lên và chốt số đo cân nặng.
+   - Bo mạch YOLO UNO bắt sóng BLE, rung chuông hoặc nhấp nháy đèn xác nhận.
+   - Dòng 1 màn hình LCD cập nhật: `W: 65.4kg  ...`
+4. Camera OhStem tự động ghi hình người đứng:
+   - ESP32-S3 nạp ảnh trực tiếp qua Wi-Fi, chạy mô hình YOLO26n INT8 trong ~700ms.
+   - Nhận diện đỉnh đầu, tính toán khoảng cách và chiều cao theo mô hình Pinhole Camera.
+   - Dòng 1 cập nhật chiều cao: `W: 65.4kg H: 172cm`
+   - Dòng 2 tự động tính toán chỉ số BMI: `BMI: 22.1 (Normal)`
 5. Toàn bộ chu trình hoạt động hoàn toàn tự động, khép kín trên chip mà không cần máy tính phụ trợ!
 
 ---
@@ -275,7 +287,7 @@ Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toà
 
 | Hiện tượng lỗi | Nguyên nhân khả dĩ | Cách khắc phục triệt để |
 |---|---|---|
-| **PowerShell báo lỗi `ESP-IDF not found` khi chạy `build.ps1`** | ESP-IDF được cài ở ổ đĩa khác đường dẫn mặc định. | Truyền tham số đường dẫn trực tiếp: `powershell -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -EspressifRoot "C:\Espressif" -Flash -Port COMx`. |
+| **PowerShell báo lỗi `ESP-IDF SDK not found`** | Chưa cài SDK hoặc chưa tìm đúng thư mục SDK. | Hoàn thành mục 2.3, truyền `-IDFPath "<thư mục esp-idf thực tế>"`; kiểm tra có `tools/idf.py` và `export.ps1`. Build trước khi thêm `-Flash`. |
 | **Không tìm thấy cổng COM trong Device Manager** | Thiếu Driver USB Serial (CH340 hoặc CP210x) hoặc cáp USB là cáp chỉ sạc. | 1. Tải và cài driver CH340 (`CH341SER.EXE`).<br>2. Đổi cáp USB Type-C khác có hỗ trợ truyền dữ liệu. |
 | **Màn hình LCD 16×2 sáng nhưng không hiện chữ (chỉ hiện 16 ô vuông đen)** | Chiết áp vi chỉnh độ tương phản (Contrast) ở mặt sau bo I2C chưa được xoay đúng mức. | Lấy tuốc nơ vít nhỏ xoay nhẹ biến trở màu xanh dương ở mặt lưng mạch I2C đến khi chữ hiện rõ nét. |
 | **Bo mạch báo `WiFi connect failed`** | Mạng Wi-Fi là băng tần 5GHz hoặc nhập sai mật khẩu. | Đảm bảo bộ phát Wi-Fi có phát sóng băng tần 2.4GHz. Chạy lại `python camera/usb_viewer.py --port COMx --configure` để nhập lại mật khẩu. |
@@ -284,4 +296,4 @@ Khi đã hoàn thành Bước 6 và Bước 7, bạn có thể **rút hoàn toà
 
 ---
 
-*Tài liệu thuộc dự án **SmartScale — Hệ Thống Đo Nhân Trắc Tự Động**, phát triển bởi nhóm 6 thuộc ACLAB.*
+*Tài liệu thuộc dự án **SmartScale — Hệ Thống Đo Nhân Trắc Tự Động**, phát triển bởi nhóm ACLAB.*

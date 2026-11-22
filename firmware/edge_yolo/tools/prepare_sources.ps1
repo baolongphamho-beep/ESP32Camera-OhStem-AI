@@ -1,22 +1,24 @@
+param([string]$DestinationRoot, [switch]$SkipDataset)
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
-$sharedParent = try { (Resolve-Path (Join-Path $PSScriptRoot '../../../../..') -ErrorAction Stop).Path } catch { $null }
-if ($sharedParent -and (Test-Path -LiteralPath (Join-Path $sharedParent '.edge-deps/esp-dl'))) {
-    $workspaceRoot = $sharedParent
-} else {
-    $workspaceRoot = $repoRoot
-}
+$workspaceRoot = $repoRoot
+if ($DestinationRoot) { $workspaceRoot = [System.IO.Path]::GetFullPath($DestinationRoot) }
+$gitTool = Get-Command git -ErrorAction SilentlyContinue
+if ($gitTool) { $gitExe = $gitTool.Source }
+elseif (Test-Path -LiteralPath 'C:\Program Files\Git\cmd\git.exe') { $gitExe = 'C:\Program Files\Git\cmd\git.exe' }
+else { throw 'Install Git for Windows first.' }
 $destination = Join-Path $workspaceRoot '.edge-deps/esp-dl'
 $revision = '512ed0b0dc5f5320f3d9ca5a5aea189803f87f31'
 if (!(Test-Path -LiteralPath (Join-Path $destination '.git'))) {
-    git clone --filter=blob:none --no-checkout https://github.com/espressif/esp-dl.git $destination
+    & $gitExe clone --filter=blob:none --no-checkout https://github.com/espressif/esp-dl.git $destination
     if ($LASTEXITCODE -ne 0) { throw 'Could not clone ESP-DL' }
 }
-git -C $destination sparse-checkout set esp-dl models/yolo26 examples/tutorial/how_to_quantize_model/quantize_yolo26
+& $gitExe -C $destination sparse-checkout set esp-dl models/yolo26 examples/tutorial/how_to_quantize_model/quantize_yolo26
 if ($LASTEXITCODE -ne 0) { throw 'Could not set sparse checkout' }
-git -C $destination checkout --detach $revision
+& $gitExe -C $destination checkout --detach $revision
 if ($LASTEXITCODE -ne 0) { throw 'Could not check out pinned ESP-DL revision' }
 Write-Host "ESP-DL source ready at $destination ($revision)"
+if ($SkipDataset) { return }
 $coco8Dir = Join-Path $workspaceRoot '.edge-deps/datasets/coco8'
 if (!(Test-Path -LiteralPath (Join-Path $coco8Dir 'images/train'))) {
     $datasetsRoot = Join-Path $workspaceRoot '.edge-deps/datasets'

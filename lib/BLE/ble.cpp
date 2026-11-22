@@ -348,7 +348,7 @@ bool BLE::startService(String service_uuid)
     NimBLEService * ble_service = _ble_server->getServiceByUUID(NimBLEUUID(service_uuid.c_str()));
     if (ble_service == nullptr)     return false;
 
-    ble_service->start();
+    // NimBLE-Arduino 2.x starts services with the server; start() is a no-op.
     NimBLEAdvertising* ble_advertise = NimBLEDevice::getAdvertising();
     // To avoid "data length exceeded" errors, only add short (16-bit) UUIDs
     // to the advertising payload; 128-bit UUIDs consume too much space.

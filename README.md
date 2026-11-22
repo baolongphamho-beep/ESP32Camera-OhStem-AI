@@ -1,5 +1,7 @@
 # SmartScale — Hệ Thống Đo Nhân Trắc Tự Động (AI + Cân BLE + LCD)
 
+> **Nhánh TV5 (`feat/ui-viewer-qa`) — Plan 2 servo + UI/viewer/QA:** firmware native quét servo tìm toàn thân (5 pha `STANDBY → WAKING_HOMING → SERVO_SWEEP → LOCKED_MEASURE → RESULT_HOLD`), giữ kết quả, LCD, cấu hình/đọc lại qua USB, hiệu chuẩn servo, công cụ QA. Đã gộp phần lấy ảnh HTTP + Wi-Fi/BLE của `smartscale-edge-ai@78548a6`. Xem [mục 5](#5-nhánh-tv5-featui-viewer-qa) và [báo cáo đối chiếu](docs/reports/TV5_GITHUB_SYNC_20261122.md).
+
 > [!TIP]
 > 📖 **Dành cho người mới bắt đầu hoặc thiết lập trên laptop mới:**  
 > Vui lòng xem tài liệu hướng dẫn từng bước chi tiết tại: [**docs/SETUP_GUIDE_NEW_LAPTOP.md**](docs/SETUP_GUIDE_NEW_LAPTOP.md).  
@@ -178,3 +180,56 @@ Khi terminal hiện **`Da luu cau hinh.`**, toàn bộ thông số đã được
 ```powershell
 python -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+---
+
+## 5. Nhánh TV5 (`feat/ui-viewer-qa`)
+
+Phần việc **TV5 — UI/UX LCD, USB Config/Viewer, QA Test & Tài liệu** theo [Plan 2](docs/PLAN_2_TEAM_5_DIVISION.md), cùng bản firmware native Plan 2 mà các công cụ này dùng. Nhánh tạo từ `smartscale-edge-ai@78548a6`.
+
+### 5.1 Nhánh này có gì
+
+| Phần | File chính | Ghi chú |
+|---|---|---|
+| Firmware native Plan 2 (servo quét tìm toàn thân) | `firmware/edge_yolo/main/app_main.cpp`, `lib/EdgeSweep/edge_fsm.h` | Step-scan, chờ servo dừng + `servo_settle` + `servo_delay`, chia đôi khi bước quét nhảy qua vùng vừa khung, trung vị 3 khung |
+| Driver servo (TV3, `servo_ctrl.zip`) | `firmware/edge_yolo/main/servo_ctrl.*`, `lib/EdgeSweep/servo_motion.h` | Tăng/giảm tốc 60°/s, 240°/s²; **giới hạn cứng 45°..135°**; `tilt = servo_dir × (góc − servo_level)` |
+| Lấy ảnh camera + Wi-Fi/BLE (từ `smartscale-edge-ai`) | `http_capture_client.h`, `http_capture_parser.h`, `wifi_reconnect.h`, `wifi_credentials.h`, `ble_scan_retry.h` | Socket không chặn, nối lại Wi-Fi 2 s, quét BLE 100 ms khi chờ |
+| Giữ kết quả `ResultHold`, câu chữ LCD 16×2 | `lib/Measurements/measurement_state.h`, `lib/EdgeSweep/edge_io.h` | `hold_sec` (mặc định 12 s) |
+| Viewer + cấu hình USB | `camera/usb_viewer.py`, `camera/usb_protocol.py`, `camera/serial_port.py` | Tự tìm cổng COM, `--configure`, `--preview`, `--show-config`, `--set key=value` |
+| Hiệu chuẩn servo | `tools/servo_jog.py` | Lệnh USB `SERVO <góc>`: `level`, `up/down`, `bottom`, `top`, `save`, `config` |
+| Đo và QA | `tools/camera_fetch_bench.py`, `tools/servo_delay_probe.py`, `tools/native_probe.py`, `tools/native_qa.py`, `tools/height_error_report.py`, `tools/qa_log_check.py` | Thời gian lấy ảnh, độ trễ ảnh, log QA, bảng sai số chiều cao |
+| Tài liệu | `docs/WORKFLOW_WIFI_CONFIGURE.md`, `docs/HUONG_DAN_PLAN2.md`, `docs/QA_CHECKLIST.md`, `docs/QA_FIELD_LOG.csv`, `docs/CAU_TRUC_FILE.md` | Lắp đặt, hiệu chuẩn, vận hành, nghiệm thu |
+
+### 5.2 Build, nạp và chạy
+
+```powershell
+# Model 192x192 có sẵn trong firmware/edge_yolo/models (mặc định của nhánh này)
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ModelSize 192 -Flash
+# Cổng COM được tự tìm (USB Espressif 303A); nhiều bo thì thêm -Port COMx
+
+python camera/usb_viewer.py --configure      # Wi-Fi, URL camera, MAC cân, servo, chất lượng ảnh
+python camera/usb_viewer.py --show-config    # đọc lại cấu hình đang lưu (không có mật khẩu)
+python tools/servo_jog.py --start 90         # hiệu chuẩn servo_level / servo_dir / bottom / top
+python camera/usb_viewer.py --preview        # thử camera + YOLO, không cần cân/servo
+python camera/usb_viewer.py                  # chạy Plan 2 đầy đủ
+```
+
+### 5.3 Kiểm thử
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_all_tests.ps1
+```
+Kết quả trên nhánh: **20 nhóm PASS, 0 FAIL, 0 SKIP** (C++ FSM/hình học/servo/HTTP/Wi-Fi/BLE + 130 test Python + mô phỏng QA).
+
+### 5.4 Đã thử trên phần cứng / chưa thử
+
+- **Đã thử (YOLO UNO thật, chưa có camera):** nạp, khởi động (tự kiểm tra model ~313 ms), đánh thức bằng cân Mi Scale 2 qua BLE, preview không treo, cấu hình + `CONFIG?`, quay servo bằng lệnh USB trong 45°..135°.
+- **Chưa thử:** lấy ảnh/nhận diện với camera thật trên bản này, quét servo trọn chu trình, LCD thật, BMI, QA1–QA6.
+
+### 5.5 Khác với `smartscale-edge-ai` (cần TV1 xem khi ghép)
+
+- Thay bằng bản Plan 2: `firmware/edge_yolo/main/app_main.cpp`, `edge_io.cpp/.h`, `servo_ctrl.*`, `capture_gate.h`, `edge_geometry.h`, `CMakeLists.txt`, `build.ps1`, `sdkconfig.defaults`; `camera/usb_viewer.py`, `usb_protocol.py`; `lib/Measurements/measurement_state.h` (giữ thêm `setHoldMs/holdMs` của GitHub).
+- `camera/power_monitor.py`: **gộp** bản GitHub (`format_telemetry_line`) với tự tìm cổng + `--log` của TV5.
+- Giữ nguyên nhưng firmware nhánh này không dùng: `servo_math.h`, `standby_schedule.h` (test vẫn chạy), `camera/servo_bench.py` (dành cho chế độ `-ServoTest` của `smartscale-edge-ai`).
+- Gỡ vì kiểm tra code đã bị thay: `tests/servo_driver_test.cpp`, `tests/servo_stubs/`, `tests/camera_power_integration_test.cpp`.
+- Quy ước servo: chung dấu `servo_dir` với `servo_math.h`; dải xung nhánh này 500–2400 µs (GitHub 500–2500 µs) — cần chốt theo servo thật.

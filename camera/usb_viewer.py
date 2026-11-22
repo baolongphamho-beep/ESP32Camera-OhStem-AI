@@ -1,83 +1,173 @@
-"""View JPEGs/results from YOLO UNO. No model or inference runs on this PC."""
+"""View JPEGs/results from YOLO UNO. No model or inference runs on this PC.
+
+  usb_viewer.py                                  xem anh + ket qua (tu tim cong; --port COMx neu can)
+  usb_viewer.py --show-config                    doc lai cau hinh dang luu tren UNO (khong mo cua so)
+  usb_viewer.py --configure                      nhap Wi-Fi, camera, MAC can, lap dat, servo
+  usb_viewer.py --preview                        test camera + YOLO tren UNO, khong can can/servo
+  usb_viewer.py --preview --log .edge-deps/qa/camera.jsonl  ghi QA metadata, khong luu anh
+  usb_viewer.py --set servo_pin=10 --set hold_sec=12   gui cau hinh khong can hoi
+  usb_viewer.py --port COM7 --preview --set cam_framesize=5 --set cam_quality=12   anh net hon
+
+Frame JSON fields drawn when present (older firmware may omit any of them):
+status, boxes, height_cm, distance_m, weight_kg, weight_stable, bmi, processing_ms,
+phase, servo_deg, tilt_deg, framing, margin_px (Plan 2).
+"""
 import argparse
+import getpass
 import math
-import re
 import time
 
-from usb_protocol import Parser, SessionFilter, config_commands
+from serial_port import add_port_argument, port_or_exit
+from usb_protocol import CONFIG_QUERY, FORBIDDEN_SERVO_PINS, NUMERIC_LIMITS, config_set_args, format_config, Parser, SessionFilter, config_commands
+from telemetry import POWER_KEYS, PacketRecorder, power_lines
 
-_MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}$")
+# ---------------------------------------------------------------------------
+# Pure helpers (no OpenCV): tested by tests/test_usb_viewer.py
+# ---------------------------------------------------------------------------
 
+YELLOW, GREEN, ORANGE, RED, WHITE = (0, 255, 255), (0, 220, 0), (0, 165, 255), (0, 0, 255), (255, 255, 255)
 
-def validate_mac(text):
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    if not _MAC_RE.fullmatch(stripped):
-        raise ValueError("Dia chi MAC phai co dang AA:BB:CC:DD:EE:FF (6 cap hex).")
-    return stripped.lower()
-
-
-def validate_hold_sec(text, default=10):
-    stripped = text.strip()
-    if not stripped:
-        return default
-    if not re.fullmatch(r"[0-9]+", stripped):
-        raise ValueError("Thoi gian giu ket qua phai la so nguyen tu 0 den 60 giay.")
-    value = int(stripped)
-    if not 0 <= value <= 60:
-        raise ValueError("Thoi gian giu ket qua phai la so nguyen tu 0 den 60 giay.")
-    return value
+# framing (Plan 2 FramingStatus) -> (box colour, hint shown to the operator)
+FRAMING_STYLE = {
+    "fullbody": (GREEN, ""),
+    "topclipped": (ORANGE, "Head cut off - servo should tilt up"),
+    "bottomclipped": (ORANGE, "Feet cut off - servo should tilt down"),
+    "sideclipped": (ORANGE, "Person cut at the side"),
+    "tooclose": (RED, "Step back! Too close to camera"),
+    "none": (YELLOW, "No person in frame"),
+}
 
 
-def format_metric(value, unit="", fmt=".1f"):
-    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        return "--"
-    formatted = format(value, fmt)
-    return f"{formatted} {unit}" if unit else formatted
+def _number(value):
+    """Finite float or None (bool, text and NaN are not numbers here)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
-def format_timing_line(metadata):
-    proc_ms = metadata.get("processing_ms")
-    cap_ms = metadata.get("capture_ms")
-    if cap_ms is not None:
-        keep_alive = metadata.get("keep_alive")
-        ka_tag = ""
-        if isinstance(keep_alive, bool):
-            ka_tag = " [KA]" if keep_alive else " [NEW]"
-        line = f"AI: {proc_ms} ms   Net: {cap_ms} ms{ka_tag}"
-    else:
-        line = f"On-board processing: {proc_ms} ms"
-    rssi = metadata.get("wifi_rssi")
-    if isinstance(rssi, int) and not isinstance(rssi, bool) and rssi != 0:
-        line += f"   RSSI: {rssi} dBm"
-    return line
+def fmt(value, digits=1, unit=""):
+    number = _number(value)
+    return "--" if number is None else f"{number:.{digits}f}{unit}"
 
 
-def open_device(name):
-    import serial
-    from serial.tools import list_ports
-    try:
-        # Disable DTR/RTS before opening so Windows does not pulse the
-        # ESP32-S3 USB-Serial/JTAG reset circuit on open/close.
-        port = serial.Serial(None, 115200, timeout=.01, write_timeout=3, dsrdtr=False, rtscts=False)
-        port.port = name
-        port.dtr = False
-        port.rts = False
-        port.open()
-        port.reset_input_buffer()
-        return port
-    except serial.SerialException as error:
-        print(f"Khong mo duoc cong {name}: {error}", flush=True)
-        ports = list(list_ports.comports())
-        print("Cac cong Windows dang nhan:", flush=True)
-        for port in ports:
-            print(f"  {port.device}: {port.description}", flush=True)
-        if not ports:
-            print("  Khong co cong nao.", flush=True)
-        print("Kiem tra cap USB, cam lai UNO va dong Serial Monitor/viewer khac.", flush=True)
-        print("Neu so COM thay doi, chay lai voi --port COM_moi. Chua gui cau hinh.", flush=True)
-        raise SystemExit(1) from None
+def safe_boxes(raw):
+    """[(x1, y1, x2, y2, conf)] from metadata['boxes'], skipping malformed entries."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for box in raw:
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        values = [_number(v) for v in box[:5]]
+        if any(v is None for v in values[:4]):
+            continue
+        x1, y1, x2, y2 = values[:4]
+        if x2 <= x1 or y2 <= y1:
+            continue
+        conf = values[4] if len(values) > 4 and values[4] is not None else 0.0
+        out.append((x1, y1, x2, y2, conf))
+    return out
+
+
+def framing_style(framing):
+    """(colour, hint) for a framing string; unknown values stay visible as text."""
+    if not isinstance(framing, str) or not framing:
+        return GREEN, ""
+    return FRAMING_STYLE.get(framing.replace("_", "").lower(), (YELLOW, ""))
+
+
+def margin_rect(width, height, margin_px):
+    """Safe-area rectangle (x1, y1, x2, y2) or None when margin_px is missing/invalid."""
+    m = _number(margin_px)
+    if m is None or m <= 0 or 2 * m >= min(width, height):
+        return None
+    return (round(m), round(m), round(width - m), round(height - m))
+
+
+def overlay_lines(metadata):
+    """[(text, colour)] for the top-left overlay of a frame."""
+    if metadata.get("preview") is True:
+        return [("Camera test - scale and servo disabled", WHITE),
+                (str(metadata.get("status") or "Waiting for camera"), YELLOW),
+                (f"On-board processing: {fmt(metadata.get('processing_ms'), 0, ' ms')}", YELLOW),
+                (fetch_line(metadata), WHITE)]
+    lines = [(str(metadata.get("status") or ""), YELLOW),
+             (f"Height: {fmt(metadata.get('height_cm'), 1, ' cm')}   "
+              f"Distance: {fmt(metadata.get('distance_m'), 2, ' m')}", YELLOW),
+             (f"Weight: {fmt(metadata.get('weight_kg'), 2, ' kg')} "
+              f"{'LOCK' if metadata.get('weight_stable') is True else 'moving'}   "
+              f"BMI: {fmt(metadata.get('bmi'), 1)}", YELLOW)]
+    plan2 = [k for k in ("phase", "servo_deg", "tilt_deg", "framing") if k in metadata]
+    if plan2:
+        phase = metadata.get("phase")
+        framing = metadata.get("framing")
+        colour, hint = framing_style(framing)
+        lines.append((f"Phase: {phase if isinstance(phase, str) and phase else '--'}   "
+                      f"Servo: {fmt(metadata.get('servo_deg'), 1, ' deg')}   "
+                      f"Tilt: {fmt(metadata.get('tilt_deg'), 1, ' deg')}", WHITE))
+        if isinstance(framing, str) and framing:
+            lines.append((f"Framing: {framing}" + (f"  - {hint}" if hint else ""), colour))
+    lines.append((f"On-board processing: {fmt(metadata.get('processing_ms'), 0, ' ms')}", YELLOW))
+    if "capture_ms" in metadata:
+        lines.append((fetch_line(metadata), WHITE))
+    return lines
+
+
+def fetch_line(metadata):
+    """Fetch time with the image size and the UNO's Wi-Fi signal, when sent."""
+    text = f"Camera fetch over WiFi: {fmt(metadata.get('capture_ms'), 0, ' ms')}"
+    w, h = _number(metadata.get("width")), _number(metadata.get("height"))
+    if w and h:
+        text += f" | {int(w)}x{int(h)}"
+    rssi = _number(metadata.get("wifi_rssi"))
+    if rssi is not None and rssi < 0:
+        text += f" | RSSI {int(rssi)} dBm" + (" (weak)" if rssi < -70 else "")
+    return text
+
+
+def status_text(metadata):
+    """Text for a 'status' packet (no image), including the phase when sent."""
+    message = metadata.get("message")
+    message = message if isinstance(message, str) and message else "Waiting"
+    phase = metadata.get("phase")
+    return f"[{phase}] {message}" if isinstance(phase, str) and phase else message
+
+
+def parse_set_args(items):
+    """['servo_pin=10', 'hold_sec=12'] -> {'servo_pin': '10', ...} (validated later)."""
+    values = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--set expects key=value, got {item!r}")
+        values[key.strip()] = value.strip()
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Interactive configuration
+# ---------------------------------------------------------------------------
+
+SERVO_PROMPTS = [
+    ("servo_pin", "Chan GPIO servo (Plan 2 de xuat 10)"),
+    ("servo_bottom", "Goc lenh servo diem bat dau quet (do)"),
+    ("servo_top", "Goc lenh servo diem ket thuc quet (do)"),
+    ("servo_step", "Buoc quet moi lan (do)"),
+    ("servo_level", "Goc lenh servo khi camera nam ngang (do)"),
+    ("servo_dir", "Chieu: -1 neu tang goc lam camera NGANG LEN, 1 neu lam camera CUI XUONG"),
+    ("servo_settle", "Thoi gian cho sau khi servo dung han (ms)"),
+    ("servo_delay", "Do tre anh camera (ms, TV3 uoc luong 500)"),
+    ("servo_dps", "Toc do quet lien tuc (do/s, chi native servoSweepStart)"),
+    ("hold_sec", "Giu ket qua H/W/BMI sau khi buoc xuong (giay)"),
+]
+
+
+CAMERA_PROMPTS = [
+    ("cam_framesize", "Do phan giai camera: 5=320x240 (nhanh, da thu), 6=400x296, 7=480x320, "
+                      "8=640x480 (cham hon); -1 = khong doi"),
+    ("cam_quality", "Chat luong JPEG camera: 10-12 = net hon, 15 = ban dang dung; -1 = khong doi"),
+]
 
 
 def ask_number(prompt, default, low, high, zero=False):
@@ -85,75 +175,59 @@ def ask_number(prompt, default, low, high, zero=False):
         text = input(f"{prompt} [{default}]: ").strip() or str(default)
         try:
             value = float(text)
-            if math.isfinite(value) and (low <= value <= high or (zero and value == 0)):
+            if low <= value <= high or (zero and value == 0):
                 return value
         except ValueError:
             pass
         print(f"Nhap so trong khoang {low}..{high}.")
 
 
-def configure():
-    values = {}
-    while True:
-        ssid = input("WiFi SSID (Enter = giu nguyen): ").strip()
-        if not ssid:
-            break
-        if len(ssid.encode()) > 32:
-            print("WiFi SSID toi da 32 byte.")
-            continue
-        values["ssid"] = ssid
-        while True:
-            password = input("WiFi password (hien khi nhap, khong ghi file, Enter neu WiFi mo): ")
-            if "\r" in password or "\n" in password or "\x00" in password:
-                print("Mat khau khong duoc chua ky tu xuong dong.")
-                continue
-            if len(password.encode()) > 64:
-                print("WiFi password toi da 64 byte.")
-                continue
-            values["password"] = password
-            break
-        break
+def ask_yes(prompt, default):
+    text = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    return default if not text else text in {"y", "yes", "c", "co"}
 
-    while True:
-        url = input("URL hoac IP camera (Enter = giu nguyen, vi du http://10.127.7.68/capture): ").strip()
-        if not url:
-            break
-        if not url.startswith(("http://", "https://")):
-            url = "http://" + url
-        if not url.startswith("http://"):
-            print("Camera URL phai bat dau bang http:// (camera OhStem khong ho tro HTTPS).")
-            continue
-        host_and_path = url[len("http://"):].rstrip("/")
-        if not host_and_path:
-            print("URL/IP camera khong hop le.")
-            continue
-        if "/" not in host_and_path:
-            url = f"http://{host_and_path}/capture"
-            print(f"  -> Tu dong them /capture: {url}")
-        if len(url.encode()) > 159:
-            print("Camera URL qua dai (toi da 159 byte).")
-            continue
-        values["camera"] = url
-        break
 
+def ask_optional(key, prompt):
+    """Ask one Plan 2 key; Enter keeps the value stored on the UNO (returns None)."""
+    _, low, high = NUMERIC_LIMITS[key]
     while True:
-        mac_raw = input("MAC can Mi Scale 2 (Enter = giu nguyen, vd 70:87:9e:ea:3a:e0, 00:00:00:00:00:00 = tat loc): ")
+        text = input(f"{prompt} [{low}..{high}, Enter = giu nguyen]: ").strip()
+        if not text:
+            return None
         try:
-            mac = validate_mac(mac_raw)
-            if mac:
-                values["mac"] = mac
-            break
-        except ValueError as exc:
-            print(exc)
+            config_commands({key: text})  # Same validation as the sent command.
+            if key == "servo_pin" and int(float(text)) in FORBIDDEN_SERVO_PINS:
+                print(f"Canh bao: GPIO{int(float(text))} la chan USB/flash/UART0/LCD; van gui theo yeu cau.")
+            return text
+        except ValueError as error:
+            print(f"Khong hop le: {error}")
 
+
+def ask_mac():
     while True:
-        mode = input("Che do fixed / ground [fixed]: ").strip().lower() or "fixed"
-        if mode in {"fixed", "ground"}:
-            values["mode"] = mode
-            break
-        print("Chi chap nhan fixed hoac ground.")
+        text = input("MAC can Mi Scale 2 (scaleMac), vi du 70:87:9e:ea:3a:e0 (Enter = giu nguyen): ").strip()
+        if not text:
+            return None
+        try:
+            config_commands({"scaleMac": text})
+            return text
+        except ValueError as error:
+            print(f"Khong hop le: {error}")
 
+
+def ask_geometry(values):
+    mode = input("Che do fixed / ground / servo (servo = Plan 2, env yolo_uno_servo_sweep) [fixed]: "
+                 ).strip().lower() or "fixed"
+    if mode not in {"fixed", "ground", "servo"}:
+        raise ValueError("Chi chap nhan fixed, ground hoac servo")
     print("fy/H = tieu cu pixel chia chieu cao anh; KHONG nhap tieu cu mm.")
+    if mode == "servo":
+        # Plan 2: the tilt comes from the servo (servo_level/servo_dir), so only the
+        # mounting height and fy/H are needed; no "mode" key (the firmware has one mode).
+        values["height"] = ask_number("Truc servo/tam camera cao hon mat can (cm)", 110, 1, 400)
+        values["focal"] = ask_number("fy/H (OV2640 3.6 mm o 320x240 ~ 1.33)", 1.33, .01, 20)
+        return
+    values["mode"] = mode
     if mode == "fixed":
         print("Camera dat ngang. Nguoi chuan phai dung trong khung ngay frame full-body dau tien.")
         values["distance"] = ask_number("Khoang cach camera - vi tri dung (m)", 3, .1, 20)
@@ -165,153 +239,282 @@ def configure():
         values["tilt"] = ask_number("Goc nghieng xuong (do, duong = xuong)", 0, -79, 79)
         values["focal"] = ask_number("fy/H (lay tu hieu chuan camera)", 1, .01, 20)
 
-    while True:
-        hold_raw = input("Thoi gian giu ket qua LCD sau khi buoc xuong (giay, 0..60, 0 = tat) [10]: ")
-        try:
-            values["hold_sec"] = validate_hold_sec(hold_raw, default=10)
-            break
-        except ValueError as exc:
-            print(exc)
+
+def configure():
+    """Ask section by section; returns the command bytes, or None if nothing changed."""
+    values = {}
+    ssid = input("WiFi SSID (Enter = giu nguyen): ").strip()
+    if ssid:
+        values["ssid"] = ssid
+        values["password"] = getpass.getpass("WiFi password (khong hien / khong ghi file): ")
+    url = input("URL anh camera (Enter = giu nguyen, vi du http://10.127.7.68/capture): ").strip()
+    if url:
+        if not url.startswith("http://"):
+            raise ValueError("Camera URL phai bat dau bang http://")
+        values["camera"] = url
+    mac = ask_mac()
+    if mac:
+        values["scaleMac"] = mac
+    # Default yes: same questions as before for users who just press Enter.
+    if ask_yes("Nhap thong so lap dat (mode, khoang cach, fy/H)?", True):
+        ask_geometry(values)
+    if ask_yes("Nhap thong so servo va thoi gian giu ket qua (Plan 2)?", False):
+        while True:
+            servo = {key: ask_optional(key, prompt) for key, prompt in SERVO_PROMPTS}
+            try:
+                config_commands(servo)  # Cross-checks, e.g. bottom != top.
+                values.update(servo)
+                break
+            except ValueError as error:
+                print(f"Khong hop le: {error}. Nhap lai phan servo.")
+    # Last question, default no: Enter-only answers keep the old viewer bytes.
+    if ask_yes("Dat do phan giai / chat luong anh camera (UNO tu gui /control)?", False):
+        values.update({key: ask_optional(key, prompt) for key, prompt in CAMERA_PROMPTS})
+    values = {k: v for k, v in values.items() if v is not None}
+    if not values:
+        print("Khong co gi thay doi, khong gui cau hinh.")
+        return None
     return config_commands(values)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", required=True, help="Vi du COM9")
-    parser.add_argument("--configure", action="store_true", help="Nhap WiFi va thong so lap dat")
+# ---------------------------------------------------------------------------
+# Drawing + main loop (OpenCV)
+# ---------------------------------------------------------------------------
+
+def upscale(cv2, image, width, smooth=True):
+    """Resize for display only (PC side, adds no delay on the UNO).
+
+    smooth: bicubic + light unsharp mask, so a 320x240 JPEG looks less blocky when
+    shown at 800 px. The UNO still runs YOLO on the original camera JPEG.
+    """
+    h, w = image.shape[:2]
+    size = (width, round(h * width / w))
+    if not smooth or width <= w:
+        return cv2.resize(image, size, interpolation=getattr(cv2, "INTER_AREA", 3))
+    canvas = cv2.resize(image, size, interpolation=getattr(cv2, "INTER_CUBIC", 2))
+    blur = cv2.GaussianBlur(canvas, (0, 0), 1.2)
+    return cv2.addWeighted(canvas, 1.6, blur, -0.6, 0)
+
+
+def render_frame(cv2, image, metadata, width=800, smooth=True):
+    """Draw boxes, safe area and text; returns the resized canvas.
+
+    Boxes are drawn after resizing so their lines stay sharp at any window size.
+    """
+    h, w = image.shape[:2]
+    canvas = upscale(cv2, image, width, smooth)
+    k = width / w
+    colour, _ = framing_style(metadata.get("framing"))
+    rect = margin_rect(w, h, metadata.get("margin_px"))
+    if rect:
+        cv2.rectangle(canvas, (round(rect[0] * k), round(rect[1] * k)),
+                      (round(rect[2] * k), round(rect[3] * k)), (255, 200, 0), 1)
+    for x1, y1, x2, y2, _ in safe_boxes(metadata.get("boxes")):
+        cv2.rectangle(canvas, (round(x1 * k), round(y1 * k)), (round(x2 * k), round(y2 * k)), colour, 2)
+    lines = overlay_lines(metadata)
+    if POWER_KEYS.intersection(metadata):
+        lines += [(line, WHITE) for line in power_lines(metadata)]
+    for i, (line, line_colour) in enumerate(lines):
+        cv2.putText(canvas, line, (10, 25 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX, .55, line_colour, 2)
+    return canvas
+
+
+def scale_notice_lines(metadata):
+    """TV2 power packets do not imply camera/height/BMI validity."""
+    lines = [f"{metadata.get('phase') or 'Waiting'} | CPU: {fmt(metadata.get('cpu_mhz'), 0, ' MHz')}"
+             f" | BLE: {fmt(metadata.get('ble_duty_percent'), 1, '%')}",
+             f"Weight: {fmt(metadata.get('weight_kg'), 2, ' kg')} | "
+             f"{'LOCK' if metadata.get('weight_stable') is True else 'unlocked' if metadata.get('weight_stable') is False else 'LOCK unknown'}"]
+    if metadata.get("phase") == "RESULT_HOLD":
+        lines.append(f"Height: {fmt(metadata.get('height_cm'), 1, ' cm')} | "
+                     f"BMI: {fmt(metadata.get('bmi'), 1)}")
+    return lines + power_lines(metadata)
+
+
+def _run():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_port_argument(parser)
+    parser.add_argument("--configure", action="store_true", help="Nhap WiFi, camera, MAC can, lap dat, servo")
+    parser.add_argument("--preview", action="store_true", help="Test anh + YOLO tren UNO, khong can can/servo")
+    parser.add_argument("--log", help="Append metadata-only QA JSONL (no JPEG/password); use .edge-deps/qa/")
+    parser.add_argument("--show-config", action="store_true",
+                        help="Doc lai cau hinh dang luu tren UNO (CONFIG?), khong mo cua so")
+    parser.add_argument("--raw-view", action="store_true",
+                        help="Phong to anh kieu cu (khong lam net); khong anh huong UNO")
+    parser.add_argument("--set", action="append", metavar="KEY=VALUE",
+                        help="Gui mot khoa cau hinh, lap lai duoc (vi du --set hold_sec=12)")
     args = parser.parse_args()
+    try:
+        preset = config_commands(parse_set_args(args.set)) if args.set else None
+    except ValueError as error:
+        parser.error(str(error))  # Before opening the port: nothing is sent.
+    if args.show_config:
+        return show_config(port_or_exit(args.port), preset)
     import cv2
     import numpy as np
-    import serial
     decoder = Parser()
     sessions = SessionFilter()
     title = "SmartScale - YOLO UNO USB viewer (Q to quit)"
     background = np.zeros((480, 800, 3), np.uint8)
     last_image = 0
+    first_frame = True
+    first_person = True
     notice = "Waiting for YOLO UNO..."
-    try:
-        with open_device(args.port) as port:
-            print(f"Da mo {args.port}.", flush=True)
-            commands = configure() if args.configure else None
-            awaiting_config_ack_deadline = None
-            # Do not toggle DTR/RTS: this board uses native USB Serial/JTAG.
-            if commands:
-                port.reset_input_buffer()
-                port.write(commands)
-                port.flush()
-                awaiting_config_ack_deadline = time.monotonic() + 5.0
+    notice_lines = [notice]
+    config_warning = None
+    args.port = port_or_exit(args.port)
+    with PacketRecorder(args.log) as recorder, open_device(args.port) as port:
+        print(f"Da mo {args.port}.", flush=True)
+        commands = configure() if args.configure else preset
+        if args.configure and preset:
+            print("Bo qua --set vi da dung --configure.")
+        # Do not toggle DTR/RTS: this board uses native USB Serial/JTAG.
+        if commands:
+            port.write(commands)
+        if args.preview:
+            print("Camera test: YOLO runs on UNO; scale/servo disabled. Q to stop.", flush=True)
+        renew_at = 0
+        try:
             while True:
-                try:
-                    frames = []
-                    drained = 0
-                    while port.in_waiting > 0 and drained < 262144:
-                        chunk = port.read(min(port.in_waiting, 65536))
-                        if not chunk:
-                            break
-                        drained += len(chunk)
-                        frames.extend(decoder.feed(chunk))
-                except serial.SerialException as exc:
-                    print(f"Mat ket noi USB voi YOLO UNO: {exc}", flush=True)
-                    break
-
-                latest_frame = None
+                if args.preview and time.monotonic() >= renew_at:
+                    port.write(b"PREVIEW ON\n")
+                    renew_at = time.monotonic() + 3
+                frames = decoder.feed(port.read(min(max(port.in_waiting, 1), 65536)))
                 for metadata, jpeg in frames:
+                    recorder.write(metadata, len(jpeg))
+                    previous_session = sessions.session
                     if not sessions.accept(metadata):
                         continue
+                    if previous_session is not None and sessions.session != previous_session:
+                        last_image = 0  # Never display the previous person's image during a new arrival.
+                        notice_lines = ["New scale session. Waiting for a fresh frame..."]
                     kind = metadata.get("kind")
                     if kind == "config":
-                        awaiting_config_ack_deadline = None
                         print("Da luu cau hinh." if metadata.get("ok") else "Cau hinh bi tu choi.")
-                        if metadata.get("ok") and not last_image:
-                            notice = "Configuration saved. Fetching camera frame..."
+                        config_warning = None if metadata.get("ok") else "Config rejected - check terminal and retry"
+                        last_image = 0
+                        notice_lines = ["Configuration saved. Waiting for a fresh frame." if metadata.get("ok")
+                                        else "Configuration rejected. Check terminal values and retry."]
                     elif kind == "boot":
                         print("On-board self-test:", metadata)
-                    elif kind == "scale":
-                        phase = metadata.get("phase", "Waiting")
-                        notice = (f"{phase} | CPU: {metadata.get('cpu_mhz')} MHz | "
-                                  f"BLE: {metadata.get('ble_duty_percent')}%")
-                        if phase == "RESULT_HOLD":
-                            notice += (f" | H: {format_metric(metadata.get('height_cm'), 'cm', '.1f')}  "
-                                       f"W: {format_metric(metadata.get('weight_kg'), 'kg', '.2f')}  "
-                                       f"BMI: {format_metric(metadata.get('bmi'), '', '.2f')}")
-                        elif metadata.get("weight_kg") is not None:
-                            w_state = "LOCK" if metadata.get("weight_stable") else "moving"
-                            notice += f" | W: {format_metric(metadata.get('weight_kg'), 'kg', '.2f')} ({w_state})"
-                        if phase in {"STANDBY", "DRAINING", "RESULT_HOLD"}:
+                        last_image = 0
+                        notice_lines = ["UNO restarted. Waiting for camera..."]
+                    elif kind == "scale" and not args.preview:
+                        notice_lines = scale_notice_lines(metadata)
+                        if metadata.get("phase") in {"STANDBY", "DRAINING", "RESULT_HOLD"}:
                             last_image = 0
                     elif kind == "status":
-                        message = metadata.get("message", "Waiting")
-                        if message != notice:
-                            print(f"[UNO] {message}", flush=True)
-                        notice = message
-                        # Keep the last video frame on screen during brief Wi-Fi
-                        # hiccups; only switch to the black screen if > 6 s old.
-                        if last_image and time.monotonic() - last_image > 6:
+                        notice = status_text(metadata)
+                        notice_lines = [notice]
+                        if metadata.get("preview") is not True and not args.preview:
                             last_image = 0
                     elif kind == "frame" and jpeg:
-                        latest_frame = (metadata, jpeg)
-
-                if awaiting_config_ack_deadline and time.monotonic() > awaiting_config_ack_deadline:
-                    print("[CANH BAO] Chua nhan duoc phan hoi xac nhan cau hinh tu YOLO UNO sau 5 giay.", flush=True)
-                    awaiting_config_ack_deadline = None
-
-                if latest_frame is not None:
-                    metadata, jpeg = latest_frame
-                    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-                    if image is not None:
-                        for box in metadata.get("boxes", []):
-                            if len(box) < 5:
-                                continue
-                            x1, y1, x2, y2, confidence = box[:5]
-                            p1 = (round(x1), round(y1))
-                            p2 = (round(x2), round(y2))
-                            cv2.rectangle(image, p1, p2, (0, 255, 0), 2)
-                            cv2.putText(image, f"{confidence:.2f}", (p1[0], max(15, p1[1] - 6)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-                        canvas = cv2.resize(image, (800, round(image.shape[0] * 800 / image.shape[1])))
-                        timing = format_timing_line(metadata)
-                        weight_kg = metadata.get("weight_kg")
-                        weight_state = ("wait scale" if weight_kg is None
-                                        else ("LOCK" if metadata.get("weight_stable") else "moving"))
-                        hold_tag = " [HOLD]" if metadata.get("held") else ""
-                        lines = [
-                            f"{metadata.get('status', '')}{hold_tag}",
-                            f"Height: {format_metric(metadata.get('height_cm'), 'cm', '.1f')}   Distance: {format_metric(metadata.get('distance_m'), 'm', '.2f')}",
-                            f"Weight: {format_metric(weight_kg, 'kg', '.2f')} ({weight_state})   BMI: {format_metric(metadata.get('bmi'), '', '.2f')}",
-                            timing,
-                        ]
-                        for i, line in enumerate(lines):
-                            cv2.putText(canvas, line, (10, 25 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
-                        background = canvas
+                        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                        if image is None:
+                            continue
+                        if first_frame:
+                            print(f"Da nhan anh {image.shape[1]}x{image.shape[0]} tu UNO; "
+                                  f"YOLO: {metadata.get('processing_ms', '?')} ms.", flush=True)
+                            first_frame = False
+                        if first_person and safe_boxes(metadata.get("boxes")):
+                            print("Da nhan dien nguoi tren YOLO UNO.", flush=True)
+                            first_person = False
+                        background = render_frame(cv2, image, metadata, smooth=not args.raw_view)
                         last_image = time.monotonic()
-
                 if not last_image or time.monotonic() - last_image > 15:
                     screen = np.zeros((480, 800, 3), np.uint8)
-                    text = notice if not last_image else "No fresh frame from YOLO UNO"
-                    # Wrap long diagnostics (reason | URL | UNO IP) to fit the window.
-                    lines = [part.strip() for part in text.split("|")]
-                    wrapped = []
-                    for line in lines:
-                        while len(line) > 60:
-                            cut = line.rfind(" ", 0, 60)
-                            cut = cut if cut > 0 else 60
-                            wrapped.append(line[:cut])
-                            line = line[cut:].strip()
-                        wrapped.append(line)
-                    for i, line in enumerate(wrapped[:14]):
-                        cv2.putText(screen, line, (12, 50 + 30 * i),
+                    lines = notice_lines if not last_image else ["No fresh frame from YOLO UNO"]
+                    for row, line in enumerate(lines):
+                        cv2.putText(screen, line, (12, 50 + 28 * row),
                                     cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 255, 255), 2)
                 else:
                     screen = background
+                if config_warning:
+                    screen = screen.copy()
+                    cv2.putText(screen, config_warning, (12, screen.shape[0] - 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, .55, RED, 2)
                 cv2.imshow(title, screen)
-                key = cv2.waitKey(5) & 0xff
-                if key in (ord('q'), ord('Q'), 27) or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+                if cv2.waitKey(1) & 0xff in (ord('q'), 27):
                     break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cv2.destroyAllWindows()
+        finally:
+            if args.preview:
+                try:
+                    port.write(b"PREVIEW OFF\n")
+                    port.flush()
+                except OSError:
+                    pass  # The firmware lease expires if USB was disconnected.
+            cv2.destroyAllWindows()
+
+
+def read_config(port, timeout=4.0, clock=time.monotonic):
+    """Send CONFIG? and return the config_values packet (None on timeout)."""
+    decoder = Parser()
+    port.write(CONFIG_QUERY)
+    end = clock() + timeout
+    while clock() < end:
+        for metadata, _ in decoder.feed(port.read(min(max(port.in_waiting, 1), 65536))):
+            if metadata.get("kind") == "config_values":
+                return metadata
+    return None
+
+
+def show_config(name, preset=None):
+    """--show-config: optional --set first (prints the ACK), then the read-back."""
+    with open_device(name) as port:
+        print(f"Da mo {name}.", flush=True)
+        if preset:
+            decoder = Parser()
+            port.write(preset)
+            end = time.monotonic() + 4
+            while time.monotonic() < end:
+                acks = [m for m, _ in decoder.feed(port.read(4096)) if m.get("kind") == "config"]
+                if acks:
+                    print("Da luu cau hinh." if acks[0].get("ok") else f"Cau hinh bi tu choi: {acks[0].get('error')}")
+                    break
+        meta = read_config(port)
+    if meta is None:
+        print("UNO khong tra loi CONFIG? (firmware cu truoc 22/11, hoac dang chay ban Arduino).")
+        return 1
+    print("Cau hinh dang dung tren UNO:")
+    for line in format_config(meta):
+        print(line)
+    backup = config_set_args(meta)
+    if backup:
+        print(f"Sao luu hieu chuan (chay lai neu can): py -3 camera\\usb_viewer.py {backup}")
+    return 0
+
+
+def open_device(name):
+    import serial
+    from serial.tools import list_ports
+    try:
+        return serial.Serial(name, 115200, timeout=.05, write_timeout=3)
+    except serial.SerialException as error:
+        print(f"Khong mo duoc cong {name}: {error}", flush=True)
+        ports = list(list_ports.comports())
+        print("Cac cong Windows dang nhan:", flush=True)
+        for port in ports:
+            print(f"  {port.device}: {port.description}", flush=True)
+        if not ports:
+            print("  Khong co cong nao.", flush=True)
+        print("Kiem tra cap USB, cam lai UNO va dong Serial Monitor/viewer khac.", flush=True)
+        print("Neu so COM thay doi, bo --port (tu tim) hoac chay lai voi --port COM_moi. Chua gui cau hinh.",
+              flush=True)
+        raise SystemExit(1) from None
+
+
+def main():
+    try:
+        return _run()
+    except OSError as error:
+        print(f"USB/log I/O error: {error}", flush=True)
+        print("Da dong viewer. Kiem tra USB/so COM, dong monitor khac va chay lai lenh.", flush=True)
+        print("Cau hinh khong tu gui lai; preview het han sau 10 s neu mat USB.", flush=True)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Da dong USB viewer.")

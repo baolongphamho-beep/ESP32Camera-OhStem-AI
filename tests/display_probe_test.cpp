@@ -5,6 +5,8 @@
 #include "../lib/Display/display.cpp"
 
 MeasurementView measurementView() { return {}; }
+static PedestrianView fakePedestrian;
+PedestrianView pedestrianView() { return fakePedestrian; }
 
 static void resetTest() {
     delete lcd;
@@ -55,6 +57,50 @@ int main() {
     Wire.devices[{11, 12}] = {0x20, 0x27};
     initDisplay();
     assert(!lcd && std::strcmp(displayStatus(), "ambiguous-address") == 0);
+
+#ifdef SERVO_SWEEP_MODE
+    // Servo sweep: rows come from setDisplayLines(); backlight follows setDisplayBacklight().
+    resetTest();
+    Wire.devices[{11, 12}] = {0x27};
+    initDisplay();
+    assert(lcd && lcd->lit);
+    setDisplayLines("Aligning cam...", "Stand still");
+    testNow += 300;
+    updateDisplay();
+    assert(lcd->lines[0] == "Aligning cam... " && lcd->lines[1] == "Stand still     ");
+    setDisplayLines("Standby", "Step on scale");
+    setDisplayBacklight(false);
+    testNow += 300;
+    updateDisplay();
+    assert(!lcd->lit && lcd->lines[0] == "Standby         ");
+    setDisplayBacklight(true);
+    assert(lcd->lit);
+    // Camera UART GPIO8/9 and the servo pin are never probed for I2C.
+    resetTest();
+    Wire.devices[{8, 9}] = {0x27};
+    initDisplay();
+    assert(!lcd);
+#endif
+#if !defined(HEIGHT_SERVO_BMI_MODE) && !defined(SERVO_SWEEP_MODE)
+    // Project 3 pedestrian screen takes over while fresh, then normal screens return.
+    resetTest();
+    Wire.devices[{11, 12}] = {0x27};
+    initDisplay();
+    fakePedestrian = {true, true, 1.8f};
+    testNow += 300;
+    updateDisplay();
+    assert(lcd->lines[0] == "Pedestrian 1.80m");
+    assert(lcd->lines[1] == "!! TOO CLOSE !! ");
+    fakePedestrian = {true, false, 12.34f};
+    testNow += 300;
+    updateDisplay();
+    assert(lcd->lines[0] == "Pedestrian 12.3m");
+    assert(lcd->lines[1] == "Safe distance   ");
+    fakePedestrian = {};
+    testNow += 300;
+    updateDisplay();
+    assert(lcd->lines[0] == "No people       ");
+#endif
     resetTest();
     return 0;
 }

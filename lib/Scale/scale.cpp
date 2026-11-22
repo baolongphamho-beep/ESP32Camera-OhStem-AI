@@ -8,6 +8,21 @@ const char* scaleServiceStatus() {
     return service_status.load();
 }
 
+// Scale MAC: build default SCALE_MAC (lib/Config/config.h), or set from NVS before
+// runScaleService() starts (env yolo_uno_servo_sweep: usb_viewer.py "mac" key).
+static char scale_mac[18] = SCALE_MAC;
+
+void setScaleMac(const char* mac) {
+    if (mac && strlen(mac) == 17) {
+        memcpy(scale_mac, mac, 17);
+        scale_mac[17] = '\0';
+    }
+}
+
+const char* scaleMac() {
+    return scale_mac;
+}
+
 static bool createScaleTask(TaskFunction_t task, const char* name, uint32_t stack, UBaseType_t priority) {
     const BaseType_t result = xTaskCreate(task, name, stack, nullptr, priority, nullptr);
     Serial.printf("[TASK] %s: %s; free heap=%lu\n", name,
@@ -33,7 +48,7 @@ static float lfoot_force_values [NB_OF_FORCE_SENSORS / 2] = {0.0},
              rfoot_force_values [NB_OF_FORCE_SENSORS / 2] = {0.0};
 static QueueHandle_t force_value_mutex = xSemaphoreCreateMutex();
 
-static const char * ForceCharUUID [] = {
+[[maybe_unused]] static const char * ForceCharUUID [] = {
         LEFT_CHAR_UUID, 
         RIGHT_CHAR_UUID
 }; 
@@ -51,7 +66,6 @@ void initScaleBLEService()
     ble_node = new BLE(); 
     // Initialize BLE for both TabletApp (Server) and MiScale2 (Client)
     ble_node->init(ESP_MODEL);
-    BLEClient * ble_client = nullptr;
     
     // ===== PRIORITY 1: Setup TabletApp BLE Server (must be ready immediately) =====
     // Create services for TabletApp Server
@@ -193,7 +207,7 @@ bool verifyForceData (uint8_t * buffer, int buffer_len)
 
 void readForceSensors(void * pvParameters)
 {
-    TickType_t latest_force_read_time = xTaskGetTickCount(), test = millis();
+    TickType_t latest_force_read_time = xTaskGetTickCount();
     master_serial.begin(ESP_SLAVE_BAUD, SERIAL_8N1, ESP_SLAVE_RX_PIN, ESP_SLAVE_TX_PIN);
 
     while (1)
@@ -449,8 +463,8 @@ void reconnectDevicesService(void * pvParameters) {
     // ===== PHASE 1: Initial MiScale2 scan and connection =====
     if (!ble_node->isConnected())
     {
-        ESP_LOGI(SCALE_TAG, "[MiScale2] PHASE 1: Starting initial scan for MiScale2 address '%s'...", SCALE_MAC);
-        if (ble_node->scan(SCALE_MAC))
+        ESP_LOGI(SCALE_TAG, "[MiScale2] PHASE 1: Starting initial scan for MiScale2 address '%s'...", scaleMac());
+        if (ble_node->scan(scaleMac()))
         {
             uint32_t scan_timeout = 0;
             while (!ble_node->isScanFound() && ble_node->isScanning() && scan_timeout < 16000) {
@@ -498,10 +512,10 @@ void reconnectDevicesService(void * pvParameters) {
                 if (!ble_node->isScanning()) {
                     // No match in the finished scan: start another round, rather
                     // than waiting forever for a callback from an inactive scan.
-                    ESP_LOGW(SCALE_TAG, "[MiScale2] Scan finished without scale; restarting scan for %s", SCALE_MAC);
+                    ESP_LOGW(SCALE_TAG, "[MiScale2] Scan finished without scale; restarting scan for %s", scaleMac());
                     ble_node->resetScan();
                     service_status.store("scale not found; scanning again");
-                    is_rescanning = ble_node->scan(SCALE_MAC);
+                    is_rescanning = ble_node->scan(scaleMac());
                 }
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
@@ -539,9 +553,9 @@ void reconnectDevicesService(void * pvParameters) {
                     ble_node->resetScan();
                     
                     // Start scanning again for MiScale2 (5s scan with 1s check = faster response)
-                    if (ble_node->scan(SCALE_MAC))
+                    if (ble_node->scan(scaleMac()))
                     {
-                        ESP_LOGI(SCALE_TAG, "[MiScale2] Rescan started for %s, will check every 1s for device to power on...", SCALE_MAC);
+                        ESP_LOGI(SCALE_TAG, "[MiScale2] Rescan started for %s, will check every 1s for device to power on...", scaleMac());
                         is_rescanning = true;
                     }
                     failed_reconnect_count = 0;

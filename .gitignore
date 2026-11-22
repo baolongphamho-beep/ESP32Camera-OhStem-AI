@@ -1,26 +1,46 @@
-.pio/
-.platformio/
-.vscode/
-Reference
-SampleCode
+# ===== Python =====
+venv/
 .venv/
+.venv-camera/
+.venv-edge/
 .venv-*/
-*.log
-.git_corrupted_backup/
+env/
 __pycache__/
+*.py[cod]
+
+# ===== Thông tin nhạy cảm / cấu hình riêng từng máy =====
+camera_secrets.txt
 camera/calibration.json
 camera/settings.json
+
+# ===== Flash dumps of the lab camera (may contain Wi-Fi passwords) + model weights =====
+backup_original_camera.bin
+spiffs_dump.bin
+flash_header.bin
+*.pt
+platformio-device-monitor-*.log
+qa_run*.log
+qa_run*.csv
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+Thumbs.db
+
+# ===== PlatformIO =====
+.pio/
+
+# ===== Firmware on-device YOLO (ESP-IDF) =====
 .edge-deps/
-Ultralytics/
 firmware/backups/
 docs/camera_research/*.bin
+Ultralytics/
 firmware/edge_yolo/build/
 firmware/edge_yolo/managed_components/
-firmware/edge_yolo/dependencies.lock
 firmware/edge_yolo/sdkconfig
 firmware/edge_yolo/sdkconfig.old
+firmware/edge_yolo/models/*.espdl
 firmware/edge_yolo/models/*.onnx
 firmware/edge_yolo/models/*.info
 firmware/edge_yolo/models/*.json
-!firmware/edge_yolo/models/*.espdl
 !firmware/edge_yolo/models/*.build.json

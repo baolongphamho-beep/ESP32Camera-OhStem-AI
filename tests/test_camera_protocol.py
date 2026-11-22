@@ -5,7 +5,7 @@ import unittest
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "camera"))
-from protocol import serial_control_url
+from protocol import pedestrian_label, serial_control_url, ultralytics_model_path
 
 
 class CameraProtocolTests(unittest.TestCase):
@@ -32,6 +32,40 @@ class CameraProtocolTests(unittest.TestCase):
         for confidence in (float("nan"), float("inf"), -0.1, 1.1):
             with self.assertRaises(ValueError):
                 serial_control_url("http://camera", "NO_PEOPLE", confidence)
+
+
+    def test_pedestrian_label_matches_firmware(self):
+        # Same grammar as decodePedestrianLabel() in lib/Measurements/pedestrian_state.h.
+        import re
+        firmware = re.compile(r"PED_(WARN|SAFE)_D(\d+\.\d+)")
+        for distance, expect in ((1.8, "PED_WARN_D1.80"), (2.5, "PED_SAFE_D2.50"),
+                                 (3.204, "PED_SAFE_D3.20"), (120.0, "PED_SAFE_D50.00"),
+                                 (0.001, "PED_WARN_D0.01")):
+            with self.subTest(distance=distance):
+                label = pedestrian_label(distance, 2.5)
+                self.assertEqual(label, expect)
+                m = firmware.fullmatch(label)
+                self.assertTrue(m)
+                self.assertTrue(0 < float(m.group(2)) <= 50)
+                url = requests.Request("GET", serial_control_url("http://cam", label, 0.9)).prepare().url
+                self.assertEqual(url.split("serial=", 1)[1].split(";"), [label, "0.900", "stop"])
+        for bad in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                pedestrian_label(bad, 2.5)
+
+
+    def test_ultralytics_model_path_avoids_apostrophe_and_download(self):
+        import os
+        root = Path(__file__).resolve().parents[1]
+        old = os.getcwd()
+        try:
+            os.chdir(root)  # "Mira's Laptop" is above the repo: must not appear in the path.
+            self.assertEqual(ultralytics_model_path(root / "yolo26n.pt"), "yolo26n.pt")
+            self.assertNotIn("'", ultralytics_model_path(root / "yolo26n.pt"))
+            with self.assertRaises(FileNotFoundError):  # Missing file: error, never a download.
+                ultralytics_model_path(root / "no_such_model.pt")
+        finally:
+            os.chdir(old)
 
 
 if __name__ == "__main__":

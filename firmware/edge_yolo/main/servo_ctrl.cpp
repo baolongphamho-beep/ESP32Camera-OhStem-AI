@@ -1,252 +1,287 @@
+// Native tilt-servo driver. Base: TV3 servo_ctrl.zip (22/11/2026). Changes for the LAB
+// Plan 2 firmware (TV5):
+//  - servoMoveDeg() is NON-blocking (the FSM loop keeps reading scale/USB); the caller
+//    polls servoSettled(). The capture gate passes settle = servo_settle + servo_delay.
+//  - the last angle survives servoDetach(): the next servoInit() resumes from it, so
+//    homing after RESULT_HOLD is a smooth move instead of a full-speed snap.
+//  - servoDetach() waits for an in-flight tick so no pulse is written after ledc_stop().
+//  - Interface Contract extras: servoUpdate() (no-op, the esp_timer tick drives motion),
+//    servoSettled(), servoAttached(), servoCommandDeg().
 #include "servo_ctrl.h"
-#include "servo_math.h"
-#include <algorithm>
-#include <atomic>
-#include <cmath>
-#include <mutex>
-#include "driver/gpio.h"
+#include "edge_io.h"
+#include "../../../lib/EdgeSweep/servo_motion.h"
+
 #include "driver/ledc.h"
-#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 
-static const char* TAG = "servo_ctrl";
+static const char* TAG = "servo";
 
-static constexpr ledc_mode_t kLedcMode = LEDC_LOW_SPEED_MODE;
-static constexpr ledc_timer_t kLedcTimer = LEDC_TIMER_0;
-static constexpr ledc_channel_t kLedcChannel = LEDC_CHANNEL_0;
+// LEDC resources. S3 only has the low-speed group. High indices are used on purpose
+// to stay clear of anything else that might claim timer/channel 0.
+static constexpr ledc_mode_t      kMode    = LEDC_LOW_SPEED_MODE;
+static constexpr ledc_timer_t     kTimer   = LEDC_TIMER_3;
+static constexpr ledc_channel_t   kChannel = LEDC_CHANNEL_5;
+static constexpr ledc_timer_bit_t kBits    = LEDC_TIMER_14_BIT;
+static constexpr uint32_t         kFreqHz  = 50;
 
-static SemaphoreHandle_t s_servo_mutex = nullptr;
-static std::once_flag s_mutex_once;
+static constexpr int64_t kTickUs   = 20000; // = one PWM period: exactly one new duty per pulse
+static constexpr float   kHomeDps  = 90.f;  // return-to-start speed (continuous sweep)
 
-static int s_gpio = -1;
-static float s_min_deg = kServoDefaultMinDeg;
-static float s_max_deg = kServoDefaultMaxDeg;
-static float s_current_deg = kServoDefaultLevelDeg;
-static bool s_initialized = false;
-static bool s_channel_configured = false;
-static bool s_attached = false;
-static bool s_has_position = false;
-static std::atomic<bool> s_initialized_atomic{false};
-static std::atomic<bool> s_attached_atomic{false};
-static std::atomic<float> s_current_deg_atomic{kServoDefaultLevelDeg};
+enum class Phase : uint8_t { Detached, Holding, Moving, Homing, Sweeping, SweepDone };
 
-static void ensureServoMutex() {
-    std::call_once(s_mutex_once, []() {
-        s_servo_mutex = xSemaphoreCreateMutex();
-    });
+static ServoMotion s_motion;
+static ServoHistory s_hist;
+static ServoPulse s_pulse;
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static Phase s_phase = Phase::Detached;
+static esp_timer_handle_t s_timer = nullptr;
+static int s_pin = -1;
+static bool s_inited = false, s_timerCfg = false, s_attached = false, s_known = false;
+static float s_sweepDps = 15.f;
+static uint32_t s_stillSince = 0, s_sweepStartedAt = 0, s_settleMs = 0;
+static int64_t s_lastTickUs = 0;
+
+static void writeDuty(float deg) {
+    ledc_set_duty(kMode, kChannel, servoDuty(deg, s_pulse, 14));
+    ledc_update_duty(kMode, kChannel);
 }
 
-static void servoDetachLocked() {
-    if (s_channel_configured) {
-        ledc_stop(kLedcMode, kLedcChannel, 0);
-        ledc_timer_pause(kLedcMode, kLedcTimer);
+// Runs every 20 ms in the esp_timer task: independent of the YOLO inference load on
+// the main task, so the servo setpoint stays smooth.
+static void tick(void*) {
+    const int64_t t = esp_timer_get_time();
+    float dt = float(t - s_lastTickUs) / 1e6f;
+    s_lastTickUs = t;
+    dt = std::min(0.08f, std::max(0.005f, dt));
+
+    float pos;
+    bool write;
+    portENTER_CRITICAL(&s_mux);
+    write = s_attached;  // servoDetach() clears it before stopping the PWM
+    const bool done = write && s_motion.step(dt);
+    if (done) {
+        switch (s_phase) {
+            case Phase::Homing:   // reached the start angle -> begin the sweep
+                s_phase = Phase::Sweeping;
+                s_sweepStartedAt = clockMs();
+                s_motion.setTarget(s_motion.maxDeg(), s_sweepDps);
+                break;
+            case Phase::Sweeping: s_phase = Phase::SweepDone; s_stillSince = clockMs(); break;
+            case Phase::Moving:   s_phase = Phase::Holding;   s_stillSince = clockMs(); break;
+            default: break;
+        }
     }
-    s_attached = false;
-    s_attached_atomic.store(false);
+    pos = s_motion.pos();
+    if (write) s_hist.push(clockMs(), pos);
+    portEXIT_CRITICAL(&s_mux);
+    if (write) writeDuty(pos);
 }
 
-static bool servoApplyDegLocked(float deg) {
-    const float pulseUs = servoDegToPulseUs(deg);
-    const uint32_t duty = servoPulseUsToDuty(pulseUs, kServoPwmFreqHz, kServoDutyResolutionBits);
-    if (!s_attached) {
-        esp_err_t rc = ledc_timer_rst(kLedcMode, kLedcTimer);
-        if (rc == ESP_OK) {
-            rc = ledc_timer_resume(kLedcMode, kLedcTimer);
-        }
-        if (rc != ESP_OK) {
-            ESP_LOGE(TAG, "LEDC timer resume failed: %s", esp_err_to_name(rc));
-            return false;
-        }
+static bool attach() {
+    if (s_attached) return true;
+    if (!s_timerCfg) {
+        ledc_timer_config_t tc = {};
+        tc.speed_mode = kMode;
+        tc.duty_resolution = kBits;
+        tc.timer_num = kTimer;
+        tc.freq_hz = kFreqHz;
+        tc.clk_cfg = LEDC_AUTO_CLK;
+        if (ledc_timer_config(&tc) != ESP_OK) { ESP_LOGE(TAG, "LEDC timer config failed"); return false; }
+        s_timerCfg = true;
     }
-    // Use ledc_set_duty() + ledc_update_duty() instead of ledc_set_duty_and_update(),
-    // which requires ledc_fade_func_install() and otherwise returns ESP_FAIL.
-    esp_err_t rc = ledc_set_duty(kLedcMode, kLedcChannel, duty);
-    if (rc == ESP_OK) {
-        rc = ledc_update_duty(kLedcMode, kLedcChannel);
-    }
-    if (rc != ESP_OK) {
-        ESP_LOGE(TAG, "LEDC duty update failed: %s", esp_err_to_name(rc));
-        return false;
-    }
+    float pos;
+    portENTER_CRITICAL(&s_mux);
+    pos = s_motion.pos();
+    portEXIT_CRITICAL(&s_mux);
+
+    ledc_channel_config_t cc = {};
+    cc.gpio_num = s_pin;
+    cc.speed_mode = kMode;
+    cc.channel = kChannel;
+    cc.timer_sel = kTimer;
+    cc.duty = servoDuty(pos, s_pulse, 14); // first pulse already at the held angle: no glitch
+    cc.hpoint = 0;
+    if (ledc_channel_config(&cc) != ESP_OK) { ESP_LOGE(TAG, "LEDC channel config failed"); return false; }
+
+    s_lastTickUs = esp_timer_get_time();
+    portENTER_CRITICAL(&s_mux);
     s_attached = true;
-    s_attached_atomic.store(true);
+    portEXIT_CRITICAL(&s_mux);
+    if (esp_timer_start_periodic(s_timer, kTickUs) != ESP_OK) {
+        ESP_LOGE(TAG, "tick timer failed");
+        portENTER_CRITICAL(&s_mux);
+        s_attached = false;
+        portEXIT_CRITICAL(&s_mux);
+        return false;
+    }
     return true;
 }
 
-static bool servoInitInternal(int gpioPin, float minDeg, float maxDeg, float initialDeg) {
-    if (gpioPin != -1 && !isValidServoPin(gpioPin)) {
-        ESP_LOGW(TAG, "Rejected invalid or reserved servo GPIO %d", gpioPin);
-        return false;
+void servoAssumeAt(float deg) {
+    if (!std::isfinite(deg)) return;
+    portENTER_CRITICAL(&s_mux);
+    if (!s_known) {
+        s_motion.configure(SWEEP_LIMIT_MIN_DEG, SWEEP_LIMIT_MAX_DEG, kServoAccelDps2);
+        s_motion.reset(deg);
+        s_known = true;
     }
-    ensureServoMutex();
-    if (!s_servo_mutex) return false;
-    xSemaphoreTake(s_servo_mutex, portMAX_DELAY);
-
-    if (s_channel_configured && s_gpio != gpioPin) {
-        servoDetachLocked();
-        gpio_reset_pin(static_cast<gpio_num_t>(s_gpio));
-        s_channel_configured = false;
-    }
-
-    if (gpioPin == -1) {
-        servoDetachLocked();
-        s_gpio = -1;
-        s_initialized = false;
-        s_initialized_atomic.store(false);
-        s_has_position = false;
-        xSemaphoreGive(s_servo_mutex);
-        ESP_LOGI(TAG, "Servo disabled (pin=-1)");
-        return false;
-    }
-
-    float lo = minDeg;
-    float hi = maxDeg;
-    if (!std::isfinite(lo) || !std::isfinite(hi)) {
-        lo = kServoDefaultMinDeg;
-        hi = kServoDefaultMaxDeg;
-    } else {
-        lo = std::clamp(lo, kServoHardMinDeg, kServoHardMaxDeg);
-        hi = std::clamp(hi, kServoHardMinDeg, kServoHardMaxDeg);
-        if (lo >= hi) {
-            lo = kServoDefaultMinDeg;
-            hi = kServoDefaultMaxDeg;
-        }
-    }
-
-    if (!s_channel_configured) {
-        ledc_timer_config_t timerCfg = {};
-        timerCfg.speed_mode = kLedcMode;
-        timerCfg.duty_resolution = LEDC_TIMER_14_BIT;
-        timerCfg.timer_num = kLedcTimer;
-        timerCfg.freq_hz = kServoPwmFreqHz;
-        timerCfg.clk_cfg = LEDC_USE_XTAL_CLK;
-        timerCfg.deconfigure = false;
-        esp_err_t rc = ledc_timer_config(&timerCfg);
-        if (rc != ESP_OK) {
-            xSemaphoreGive(s_servo_mutex);
-            ESP_LOGE(TAG, "ledc_timer_config failed: %s", esp_err_to_name(rc));
-            return false;
-        }
-
-        ledc_channel_config_t chCfg = {};
-        chCfg.gpio_num = gpioPin;
-        chCfg.speed_mode = kLedcMode;
-        chCfg.channel = kLedcChannel;
-        chCfg.intr_type = LEDC_INTR_DISABLE;
-        chCfg.timer_sel = kLedcTimer;
-        chCfg.duty = 0;
-        chCfg.hpoint = 0;
-        chCfg.sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD;
-        rc = ledc_channel_config(&chCfg);
-        if (rc != ESP_OK) {
-            xSemaphoreGive(s_servo_mutex);
-            ESP_LOGE(TAG, "ledc_channel_config failed: %s", esp_err_to_name(rc));
-            return false;
-        }
-        s_channel_configured = true;
-    }
-
-    servoDetachLocked();
-    s_gpio = gpioPin;
-    s_min_deg = lo;
-    s_max_deg = hi;
-    s_current_deg = clampServoDeg(initialDeg, lo, hi);
-    s_current_deg_atomic.store(s_current_deg);
-    s_initialized = true;
-    s_initialized_atomic.store(true);
-    s_has_position = false;
-    xSemaphoreGive(s_servo_mutex);
-
-    ESP_LOGI(TAG, "Servo initialized on GPIO %d (limits %.1f..%.1f deg)",
-             gpioPin, lo, hi);
-    return true;
+    portEXIT_CRITICAL(&s_mux);
 }
 
 bool servoInit(int gpioPin, int minDeg, int maxDeg) {
-    const float initialDeg = 0.5f * (static_cast<float>(minDeg) + static_cast<float>(maxDeg));
-    return servoInitInternal(gpioPin, static_cast<float>(minDeg), static_cast<float>(maxDeg), initialDeg);
-}
-
-bool servoInitFromConfig(const EdgeConfig& cfg) {
-    return servoInitInternal(cfg.servoPin, cfg.servoMinDeg, cfg.servoMaxDeg, cfg.servoLevelDeg);
+    // No reserved-pin blocking (team decision 22/11); an invalid GPIO fails in LEDC.
+    if (gpioPin < 0 || gpioPin > 48 || minDeg < 0 || maxDeg > 180 || maxDeg - minDeg < 1) {
+        ESP_LOGE(TAG, "bad args pin=%d range=[%d,%d]", gpioPin, minDeg, maxDeg);
+        return false;
+    }
+    if (s_attached) servoDetach();
+    s_pin = gpioPin;
+    if (!s_timer) {
+        esp_timer_create_args_t a = {};
+        a.callback = tick;
+        a.dispatch_method = ESP_TIMER_TASK;
+        a.name = "servo_tick";
+        if (esp_timer_create(&a, &s_timer) != ESP_OK) return false;
+    }
+    // Hard travel limits (edge_config.h, 45..135 by default) win over the caller's range.
+    const float lo = std::max(float(minDeg), float(SWEEP_LIMIT_MIN_DEG));
+    const float hi = std::min(float(maxDeg), float(SWEEP_LIMIT_MAX_DEG));
+    if (hi - lo < 1.f) { ESP_LOGE(TAG, "range [%d,%d] outside hard limits", minDeg, maxDeg); return false; }
+    portENTER_CRITICAL(&s_mux);
+    const float last = s_motion.pos();
+    s_motion.configure(lo, hi, kServoAccelDps2);
+    // TV3 assumed the arm rests at minDeg. After a detach we still know where it was
+    // left (gears hold it), so resume there; only the first attach after boot snaps.
+    s_motion.reset(s_known ? last : lo);
+    s_known = true;
+    s_phase = Phase::Holding;
+    s_stillSince = clockMs();
+    s_sweepStartedAt = 0;
+    portEXIT_CRITICAL(&s_mux);
+    s_inited = true;
+    if (!attach()) return false;
+    ESP_LOGI(TAG, "ready: GPIO%d, %u Hz/14-bit, range [%d,%d] deg, pulse %.0f-%.0f us",
+             gpioPin, unsigned(kFreqHz), minDeg, maxDeg, s_pulse.minUs, s_pulse.maxUs);
+    return true;
 }
 
 void servoMoveDeg(float deg, uint32_t settleMs) {
-    ensureServoMutex();
-    if (!s_servo_mutex) return;
-    xSemaphoreTake(s_servo_mutex, portMAX_DELAY);
-    if (!s_initialized || !s_channel_configured) {
-        xSemaphoreGive(s_servo_mutex);
-        return;
+    if (!s_inited || !std::isfinite(deg) || !attach()) return;
+    portENTER_CRITICAL(&s_mux);
+    s_settleMs = settleMs;
+    if (std::fabs(s_motion.clampDeg(deg) - s_motion.target()) < 1e-3f && s_phase != Phase::Sweeping &&
+        s_phase != Phase::Homing) {
+        portEXIT_CRITICAL(&s_mux);
+        return;  // Same target: keep the running move / settle clock.
     }
-
-    const float targetDeg = clampServoDeg(deg, s_min_deg, s_max_deg);
-    uint32_t finalWaitMs = settleMs;
-    bool ok = true;
-    if (s_has_position) {
-        const float startDeg = s_current_deg;
-        const uint32_t steps = computeServoRampSteps(startDeg, targetDeg, kServoRampMaxStepDeg);
-        if (steps == 0U) {
-            ok = servoApplyDegLocked(targetDeg);
-            if (ok) {
-                s_current_deg = targetDeg;
-                s_current_deg_atomic.store(targetDeg);
-            }
-        } else {
-            for (uint32_t i = 1; i <= steps; ++i) {
-                const float stepTarget = (i == steps)
-                    ? targetDeg
-                    : (startDeg + (targetDeg - startDeg) * (static_cast<float>(i) / static_cast<float>(steps)));
-                if (!servoApplyDegLocked(stepTarget)) {
-                    ok = false;
-                    break;
-                }
-                s_current_deg = stepTarget;
-                s_current_deg_atomic.store(stepTarget);
-                if (i < steps) {
-                    vTaskDelay(pdMS_TO_TICKS(kServoRampStepDelayMs));
-                }
-            }
-        }
-    } else {
-        ok = servoApplyDegLocked(targetDeg);
-        if (ok) {
-            s_current_deg = targetDeg;
-            s_current_deg_atomic.store(targetDeg);
-            s_has_position = true;
-            finalWaitMs = std::max<uint32_t>(settleMs, 250U);
-        }
-    }
-    xSemaphoreGive(s_servo_mutex);
-
-    if (ok && finalWaitMs > 0U) {
-        vTaskDelay(pdMS_TO_TICKS(finalWaitMs));
-    }
+    s_phase = Phase::Moving;
+    s_stillSince = 0;
+    s_motion.setTarget(deg, kServoMoveDps);
+    if (!s_motion.moving()) { s_phase = Phase::Holding; s_stillSince = clockMs(); }
+    portEXIT_CRITICAL(&s_mux);
 }
+
+void servoUpdate() {}  // Motion runs in the 20 ms esp_timer tick.
 
 void servoDetach() {
-    ensureServoMutex();
-    if (!s_servo_mutex) return;
-    xSemaphoreTake(s_servo_mutex, portMAX_DELAY);
-    servoDetachLocked();
-    xSemaphoreGive(s_servo_mutex);
+    if (!s_attached) return;
+    portENTER_CRITICAL(&s_mux);
+    s_attached = false;          // a tick running right now will not write any more
+    s_motion.stop();
+    s_phase = Phase::Detached;
+    portEXIT_CRITICAL(&s_mux);
+    esp_timer_stop(s_timer);
+    vTaskDelay(pdMS_TO_TICKS(30)); // let an in-flight tick finish its ledc write
+    ledc_stop(kMode, kChannel, 0); // idle low: no pulses -> no holding current, no jitter
 }
 
-bool servoIsInitialized() {
-    return s_initialized_atomic.load();
+bool servoSettled() {
+    portENTER_CRITICAL(&s_mux);
+    const bool still = s_attached && (s_phase == Phase::Holding || s_phase == Phase::SweepDone) &&
+                       s_stillSince != 0;
+    const uint32_t since = s_stillSince, settle = s_settleMs;
+    portEXIT_CRITICAL(&s_mux);
+    return still && clockMs() - since >= settle;
 }
 
-bool servoIsAttached() {
-    return s_attached_atomic.load();
+bool servoAttached() { return s_attached; }
+
+float servoCommandDeg() {
+    portENTER_CRITICAL(&s_mux);
+    const float t = s_attached ? s_motion.target() : NAN;
+    portEXIT_CRITICAL(&s_mux);
+    return t;
 }
 
-float servoCurrentDeg() {
-    return s_current_deg_atomic.load();
+bool servoSweepStart(float speedDps) {
+    if (!s_inited || !attach()) return false;
+    portENTER_CRITICAL(&s_mux);
+    s_sweepDps = std::min(60.f, std::max(1.f, speedDps));
+    s_stillSince = 0;
+    if (std::fabs(s_motion.pos() - s_motion.minDeg()) > 0.5f) {
+        s_phase = Phase::Homing;
+        s_motion.setTarget(s_motion.minDeg(), kHomeDps);
+    } else {
+        s_phase = Phase::Sweeping;
+        s_sweepStartedAt = clockMs();
+        s_motion.setTarget(s_motion.maxDeg(), s_sweepDps);
+    }
+    portEXIT_CRITICAL(&s_mux);
+    return true;
 }
 
-float servoToTiltDeg(float servoDeg, const EdgeConfig& cfg) {
-    return servoDegToTiltDeg(servoDeg, cfg.servoLevelDeg, cfg.servoDir, cfg.tiltDeg);
+float servoStop() {
+    float pos;
+    portENTER_CRITICAL(&s_mux);
+    const bool wasMoving = (s_phase == Phase::Moving || s_phase == Phase::Homing || s_phase == Phase::Sweeping);
+    s_motion.stop(); // setpoint frozen right now; next tick re-writes the same duty
+    pos = s_motion.pos();
+    if (wasMoving) { s_phase = Phase::Holding; s_stillSince = clockMs(); }
+    portEXIT_CRITICAL(&s_mux);
+    return pos;
+}
+
+float servoDeg() {
+    portENTER_CRITICAL(&s_mux);
+    const float p = s_motion.pos();
+    portEXIT_CRITICAL(&s_mux);
+    return p;
+}
+
+ServoState servoState() {
+    portENTER_CRITICAL(&s_mux);
+    const Phase ph = s_phase;
+    portEXIT_CRITICAL(&s_mux);
+    switch (ph) {
+        case Phase::Detached:  return ServoState::Detached;
+        case Phase::Holding:   return ServoState::Holding;
+        case Phase::Moving:
+        case Phase::Homing:    return ServoState::Moving;
+        case Phase::Sweeping:  return ServoState::Sweeping;
+        default:               return ServoState::SweepDone;
+    }
+}
+
+bool servoDegAt(uint32_t ms, float& deg) {
+    portENTER_CRITICAL(&s_mux);
+    const bool ok = s_hist.at(ms, deg);
+    portEXIT_CRITICAL(&s_mux);
+    return ok;
+}
+
+uint32_t servoStillSinceMs() {
+    portENTER_CRITICAL(&s_mux);
+    const uint32_t t = s_stillSince;
+    portEXIT_CRITICAL(&s_mux);
+    return t;
+}
+
+uint32_t servoSweepStartedAtMs() {
+    portENTER_CRITICAL(&s_mux);
+    const uint32_t t = s_sweepStartedAt;
+    portEXIT_CRITICAL(&s_mux);
+    return t;
 }

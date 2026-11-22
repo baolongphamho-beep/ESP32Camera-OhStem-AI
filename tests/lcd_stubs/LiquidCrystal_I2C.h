@@ -8,7 +8,9 @@ public:
     std::string lines[2];
     LiquidCrystal_I2C(uint8_t addr, int, int) : address(addr) {}
     void init() { Wire.begin(); }
-    void backlight() {}
+    bool lit = false;
+    void backlight() { lit = true; }
+    void noBacklight() { lit = false; }
     void setCursor(int, uint8_t target) { row = target; }
     void print(const String& text) { lines[row] = text.value; }
 };

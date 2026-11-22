@@ -1,0 +1,6 @@
+{"kind":"recording_start","schema":"tv5-ssv1-v1","synthetic":true}
+{"host_ms":0,"meta":{"kind":"boot","self_test_ms":348},"jpeg_bytes":0}
+{"host_ms":100,"meta":{"kind":"status","phase":"CAMERA_TEST","session_id":1,"preview":true,"wifi_ready":true},"jpeg_bytes":0}
+{"host_ms":600,"meta":{"kind":"frame","phase":"CAMERA_TEST","session_id":1,"preview":true,"width":320,"height":240,"people_count":1,"processing_ms":325,"capture_ms":180,"decode_ms":12,"preprocess_ms":5,"inference_ms":303,"postprocess_ms":5},"jpeg_bytes":3500}
+{"host_ms":1500,"meta":{"kind":"frame","phase":"CAMERA_TEST","session_id":1,"preview":true,"width":320,"height":240,"people_count":1,"processing_ms":327,"capture_ms":480},"jpeg_bytes":3600}
+{"host_ms":2000,"meta":{"kind":"status","phase":"STANDBY","session_id":2,"preview":false},"jpeg_bytes":0}

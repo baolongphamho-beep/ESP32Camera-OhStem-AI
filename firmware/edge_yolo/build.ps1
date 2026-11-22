@@ -1,184 +1,80 @@
-param(
-    [string]$EspressifRoot,
-    [string]$IDFPath,
-    [string]$Port,
-    [switch]$Flash,
-    [switch]$ScaleOnly,
-    [switch]$CameraContinuous,
-    [switch]$ServoTest,
-    [ValidateSet(10, 25, 50, 100)]
-    [int]$StandbyScanPercent = 10
-)
+param([string]$IDFPath, [string]$EspressifRoot = 'C:\Espressif', [string]$Port,
+      [switch]$Flash, [string]$BuildRoot = 'C:\esp\SmartScale',
+      [ValidateSet(160,192,224,256)][int]$ModelSize = 192)
 $ErrorActionPreference = 'Stop'
-$modeCount = @($ScaleOnly, $CameraContinuous, $ServoTest) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
-if ($modeCount -gt 1) { throw 'Choose at most one of -ScaleOnly, -CameraContinuous, or -ServoTest.' }
-
-# Auto-detect Espressif root if not explicitly provided
-if (!$EspressifRoot) {
-    $candidateRoots = @(
-        'D:\Workspace\Espressif',
-        'C:\Espressif',
-        'D:\Espressif',
-        'C:\Workspace\Espressif'
-    )
-    foreach ($cand in $candidateRoots) {
-        if (Test-Path -LiteralPath $cand) {
-            $EspressifRoot = $cand
-            break
-        }
-    }
-    if (!$EspressifRoot) {
-        $EspressifRoot = 'D:\Workspace\Espressif'
-    }
-}
-
-if (!$IDFPath) {
-    if ($env:IDF_PATH -and (Test-Path -LiteralPath (Join-Path $env:IDF_PATH 'export.ps1'))) {
-        $IDFPath = $env:IDF_PATH
-    } else {
-        $frameworkDir = Get-ChildItem -Path (Join-Path $EspressifRoot 'frameworks') -Directory -Filter 'esp-idf-*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-        if ($frameworkDir) {
-            $IDFPath = $frameworkDir.FullName
-        } else {
-            $eimVersionDir = Get-ChildItem -LiteralPath $EspressifRoot -Directory -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'esp-idf/export.ps1') } |
-                Sort-Object Name -Descending | Select-Object -First 1
-            if ($eimVersionDir) {
-                $IDFPath = Join-Path $eimVersionDir.FullName 'esp-idf'
-            } else {
-                $IDFPath = Join-Path $EspressifRoot 'esp-idf'
-            }
-        }
-    }
-}
-
-$exportScript = Join-Path $IDFPath 'export.ps1'
-if (!(Test-Path -LiteralPath $exportScript)) {
-    throw "ESP-IDF not found at $IDFPath. Please install ESP-IDF into $EspressifRoot or specify -EspressifRoot / -IDFPath."
-}
-
-if (!$env:IDF_TOOLS_PATH) {
-    $env:IDF_TOOLS_PATH = Join-Path $EspressifRoot 'tools'
-}
-
-Write-Host "[SmartScale] Using ESP-IDF from: $IDFPath" -ForegroundColor Cyan
-Write-Host "[SmartScale] Using IDF Tools from: $env:IDF_TOOLS_PATH" -ForegroundColor Cyan
-
 $env:PYTHONUTF8 = '1'
-# A viewer venv inherited by this process carries _OLD_VIRTUAL_PATH. EIM adds
-# toolchain directories before Activate.ps1, whose deactivate step would then
-# restore that old PATH and silently remove the compiler directories again.
-# Restore it before loading EIM so its additions survive Python activation.
-if (Test-Path Env:_OLD_VIRTUAL_PATH) {
-    $env:PATH = $env:_OLD_VIRTUAL_PATH
-    Remove-Item Env:_OLD_VIRTUAL_PATH
+if (!$IDFPath) {
+    $candidates = @($env:IDF_PATH, (Join-Path $EspressifRoot 'v6.1/esp-idf'),
+                    (Join-Path $EspressifRoot 'esp-idf'))
+    $frameworks = Join-Path $EspressifRoot 'frameworks'
+    if (Test-Path -LiteralPath $frameworks) {
+        $candidates += @(Get-ChildItem -LiteralPath $frameworks -Directory -Filter 'esp-idf-*' |
+            Sort-Object Name -Descending | ForEach-Object FullName)
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate 'export.ps1'))) {
+            $IDFPath = $candidate; break
+        }
+    }
 }
-$versionName = Split-Path (Split-Path $IDFPath -Parent) -Leaf
-$eimProfile = Join-Path $EspressifRoot "tools/Microsoft.$versionName.PowerShell_profile.ps1"
-if (Test-Path -LiteralPath $eimProfile) {
-    . $eimProfile
+if (!$IDFPath -or !(Test-Path -LiteralPath (Join-Path $IDFPath 'export.ps1'))) {
+    throw 'ESP-IDF SDK not found. Install ESP-IDF 6.1, then pass -IDFPath <esp-idf folder>. PlatformIO/Arduino alone cannot build firmware/edge_yolo.'
+}
+if (!$env:IDF_TOOLS_PATH) {
+    if (Test-Path -LiteralPath (Join-Path $EspressifRoot 'python_env')) {
+        $env:IDF_TOOLS_PATH = $EspressifRoot
+    } else { $env:IDF_TOOLS_PATH = Join-Path $EspressifRoot 'tools' }
+}
+$env:IDF_PATH = $IDFPath
+$activation = Join-Path $env:IDF_TOOLS_PATH 'activate_idf_v6.1.ps1'
+if (Test-Path -LiteralPath $activation) {
+    . $activation
 } else {
-    . $exportScript
+    # Use the SDK's own Python rather than an application .venv/MSYS/Store alias.
+    $basePythonDir = Join-Path $EspressifRoot 'tools/python'
+    if (Test-Path -LiteralPath (Join-Path $basePythonDir 'python.exe')) {
+        $env:PATH = $basePythonDir + ';' + $env:PATH
+    }
+    $env:PATH = 'C:\Program Files\Git\cmd;' + $env:PATH
+    . (Join-Path $IDFPath 'export.ps1')
 }
-if (!(Get-Command xtensa-esp32s3-elf-gcc -ErrorAction SilentlyContinue)) {
-    throw 'ESP32-S3 compiler is missing from PATH after ESP-IDF activation. Check the selected ESP-IDF toolchain installation.'
+$idfPython = if ($env:IDF_PYTHON_ENV_PATH) { Join-Path $env:IDF_PYTHON_ENV_PATH 'Scripts/python.exe' } else { 'python' }
+$idfScript = Join-Path $IDFPath 'tools/idf.py'
+$model = Join-Path $PSScriptRoot "models/yolo26n_${ModelSize}_s8_s3.espdl"
+if (!(Test-Path -LiteralPath $model)) { throw 'Model missing: run firmware/edge_yolo/tools/fetch_model.ps1.' }
+$provenance = Get-Content -LiteralPath (Join-Path $PSScriptRoot "models/yolo26n_${ModelSize}_s8_s3.build.json") -Raw | ConvertFrom-Json
+if ($provenance.input_size -ne $ModelSize -or $provenance.target -ne 'esp32s3') {
+    throw 'Model metadata does not match the selected input size/target.'
 }
-Push-Location $PSScriptRoot
+if ((Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash -ne $provenance.sha256) {
+    throw 'Model hash differs from build.json; regenerate model/provenance together or run fetch_model.ps1.'
+}
+$projectDir = $PSScriptRoot
+if ($projectDir -match '\s') {
+    $stagedRoot = & (Join-Path $PSScriptRoot 'tools/stage_build.ps1') -BuildRoot $BuildRoot
+    $projectDir = Join-Path $stagedRoot 'firmware/edge_yolo'
+}
+$nativeRoot = [System.IO.Path]::GetFullPath((Join-Path $projectDir '../..'))
+$source = Join-Path $nativeRoot '.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'
+if (!(Test-Path -LiteralPath $source)) {
+    & (Join-Path $PSScriptRoot 'tools/prepare_sources.ps1') -DestinationRoot $nativeRoot -SkipDataset
+}
+Write-Host "ESP-IDF project: $projectDir" -ForegroundColor Cyan
+Push-Location $projectDir
 try {
-    # Ensure ESP-DL YOLO26 component sources exist (auto-bootstrap on a new PC).
-    $yoloCandidates = @(
-        (Join-Path $PSScriptRoot '../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
-        (Join-Path $PSScriptRoot '../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt'),
-        (Join-Path $PSScriptRoot '../../../../.edge-deps/esp-dl/models/yolo26/CMakeLists.txt')
-    )
-    $foundYolo = $false
-    foreach ($c in $yoloCandidates) {
-        if (Test-Path -LiteralPath $c) { $foundYolo = $true; break }
-    }
-    if (!$foundYolo) {
-        Write-Host "[SmartScale] Bootstrapping ESP-DL sources for first-time setup..." -ForegroundColor Yellow
-        & (Join-Path $PSScriptRoot 'tools/prepare_sources.ps1')
-    }
-
-    # If dependencies.lock references a local path from another machine, refresh it.
-    $lockFile = Join-Path $PSScriptRoot 'dependencies.lock'
-    if (Test-Path -LiteralPath $lockFile) {
-        $lockText = Get-Content -LiteralPath $lockFile -Raw
-        if ($lockText -match 'path:\s*([^\r\n]+)') {
-            $lockedPath = $Matches[1].Trim()
-            if (!(Test-Path -LiteralPath $lockedPath)) {
-                Write-Host "[SmartScale] Refreshing dependencies.lock for this PC..." -ForegroundColor Yellow
-                Remove-Item -LiteralPath $lockFile -Force
-                $managedDir = Join-Path $PSScriptRoot 'managed_components'
-                if (Test-Path -LiteralPath $managedDir) {
-                    Remove-Item -LiteralPath $managedDir -Recurse -Force
-                }
-            }
-        }
-    }
-
-    # Ensure sdkconfig includes the latest CPU, FreeRTOS tick, dual-core, cache, NimBLE, and lwIP defaults.
-    $sdkconfigFile = Join-Path $PSScriptRoot 'sdkconfig'
-    if (Test-Path -LiteralPath $sdkconfigFile) {
-        $sdkText = Get-Content -LiteralPath $sdkconfigFile -Raw
-        $requiredSdkFlags = @(
-            'CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y',
-            'CONFIG_LWIP_TCP_WND_DEFAULT=32768',
-            'CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y',
-            'CONFIG_FREERTOS_HZ=1000',
-            'CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y',
-            'CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y',
-            'CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y',
-            'CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512',
-            'CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240',
-            'CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32',
-            'CONFIG_ESP_WIFI_RX_BA_WIN=10',
-            'CONFIG_LWIP_SO_LINGER=y',
-            'CONFIG_LWIP_MAX_ACTIVE_TCP=32',
-            'CONFIG_LWIP_TCP_MSL=5000',
-            'CONFIG_LWIP_TCP_FIN_WAIT_TIMEOUT=5000',
-            'CONFIG_LWIP_TCP_SACK_OUT=y',
-            'CONFIG_PM_ENABLE=y',
-            'CONFIG_PM_PROFILING=y',
-            'CONFIG_FREERTOS_USE_TICKLESS_IDLE=y',
-            'CONFIG_BT_CTRL_MODEM_SLEEP=y',
-            'CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y',
-            'CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y',
-            'CONFIG_BT_CTRL_MAIN_XTAL_PU_DURING_LIGHT_SLEEP=y'
-        )
-        $forbiddenSdkFlags = @(
-            'CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y',
-            'CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y'
-        )
-        $needsRegen = $false
-        foreach ($flag in $requiredSdkFlags) {
-            if ($sdkText -notmatch [regex]::Escape($flag)) {
-                $needsRegen = $true
-                break
-            }
-        }
-        if (!$needsRegen) {
-            foreach ($flag in $forbiddenSdkFlags) {
-                if ($sdkText -match [regex]::Escape($flag)) {
-                    $needsRegen = $true
-                    break
-                }
-            }
-        }
-        if ($needsRegen) {
-            Write-Host "[SmartScale] Updating sdkconfig from sdkconfig.defaults..." -ForegroundColor Yellow
-            Remove-Item -LiteralPath $sdkconfigFile -Force
-        }
-    }
-
-    $scaleOnlyValue = if ($ScaleOnly) { 'ON' } else { 'OFF' }
-    $continuousValue = if ($CameraContinuous) { 'ON' } else { 'OFF' }
-    $servoTestValue = if ($ServoTest) { 'ON' } else { 'OFF' }
-    idf.py -D IDF_TARGET=esp32s3 -D "SMARTSCALE_SCALE_ONLY=$scaleOnlyValue" -D "SMARTSCALE_CAMERA_CONTINUOUS=$continuousValue" -D "SMARTSCALE_SERVO_TEST=$servoTestValue" -D "SMARTSCALE_STANDBY_SCAN_PERCENT=$StandbyScanPercent" build
+    & $idfPython $idfScript -D IDF_TARGET=esp32s3 -D "SMARTSCALE_MODEL_SIZE=$ModelSize" build
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if ($Flash) {
-        if (!$Port) { throw 'Specify -Port COMx to flash the YOLO UNO (e.g. -Port COM9).' }
-        idf.py -p $Port flash
+        if (!$Port -or $Port -eq 'auto') {
+            # Same rule as camera/serial_port.py: exactly one Espressif (VID 303A) USB port.
+            $found = @(& $idfPython -c "from serial.tools import list_ports; [print(p.device) for p in list_ports.comports() if p.vid == 0x303A]")
+            if ($found.Count -ne 1) {
+                throw "Auto port: found $($found.Count) YOLO UNO port(s) [$($found -join ', ')]. Plug in one board or pass -Port COMx."
+            }
+            $Port = $found[0]
+            Write-Host "Auto port: YOLO UNO on $Port" -ForegroundColor Cyan
+        }
+        & $idfPython $idfScript -p $Port flash
         exit $LASTEXITCODE
     }
 } finally { Pop-Location }

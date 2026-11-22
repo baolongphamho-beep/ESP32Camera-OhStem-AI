@@ -32,7 +32,7 @@ Không nạp sketch `.ino` riêng lên UNO sau bản tích hợp vì sẽ thay c
 
 ## 3. Nhập thông số khi đổi cách lắp
 
-Tại thư mục gốc `NimBLE_SmartScale_Cp`, chạy:
+Tại thư mục gốc `ESP32Camera-OhStem-AI-main`, chạy:
 
 ```powershell
 .\.venv-camera\Scripts\python.exe camera\smartscale_camera.py --ip 10.127.7.68 --configure --send-uart
@@ -127,7 +127,7 @@ Lệnh HTTP dùng dấu `;` trực tiếp theo giao diện camera gốc: `/contr
 
 Trên cửa sổ ảnh phải thấy `UART HTTP: ON`; nếu `UART: OFF`, thêm `--send-uart` hoặc chạy bằng launcher. Trạng thái ON chỉ xác nhận đã bật gửi, chưa xác nhận UNO nhận.
 
-Không nhận ảnh: kiểm tra `http://IP_CAMERA/capture`. Chạy Python lỗi model: dùng `--model DUONG_DAN_PT`; mặc định lấy `../ESP32Camera-OhStem-AI/yolo26n.pt`.
+Không nhận ảnh: kiểm tra `http://IP_CAMERA/capture`. Chạy Python lỗi model: dùng `--model DUONG_DAN_PT`; mặc định lấy `yolo26n.pt` ở thư mục gốc repo.
 
 Nếu lúc nhận HTTP lúc timeout, chỉ để một chương trình lấy ảnh/gửi UART; đóng tab Face/No Face và chương trình camera cũ. Bản mới giới hạn mặc định 3 yêu cầu ảnh/giây và 1 lệnh UART/giây, tăng thời gian chờ HTTP và thử lại với nhịp 1–3 giây khi lỗi. Không gửi thêm lệnh mỗi lần lấy ảnh thất bại. Khi ảnh lỗi, cửa sổ báo mất kết nối thay vì giữ số cũ; UNO vẫn hết hạn kết quả sau 3 giây, không kéo dài dữ liệu cũ để che lỗi mạng.
 

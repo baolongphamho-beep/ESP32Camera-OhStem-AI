@@ -1,0 +1,12 @@
+{
+  "source_revision": "512ed0b0dc5f5320f3d9ca5a5aea189803f87f31",
+  "input_size": 192,
+  "target": "esp32s3",
+  "format": "ESP-DL",
+  "calibration_dataset": "COCO8 train",
+  "calibration_steps": 8,
+  "tqt_steps": 8,
+  "bytes": 3081456,
+  "sha256": "90fdc63553edbd53ac9474f95d74a809f6d4fdd8fb8ddc0efc8d7bdc1c360619",
+  "accuracy_validated": false
+}
