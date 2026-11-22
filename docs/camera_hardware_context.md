@@ -1,3 +1,5 @@
+> Tài liệu nền nhập từ GitHub commit `c2f71b6`. Để dùng bản Plan 2 đã tích hợp trên máy này, ưu tiên [HUONG_DAN_PLAN2.md](HUONG_DAN_PLAN2.md) và [README native](../firmware/edge_yolo/README.md). Những số liệu bo/đường dẫn máy upstream cần đối chiếu lại.
+
 Dưới đây là toàn bộ thông tin kỹ thuật chi tiết về **phần cứng** và **kiến trúc firmware** của chiếc **Camera AI (AI Vision Camera / ESP32Camera OhStem)** đã được thu thập, trích xuất ngược (reverse-engineer) từ bộ nhớ ROM 16MB và kiểm chứng thực tế tại phòng lab:
 
 ## **1\. Thông số kỹ thuật & Kiến trúc Phần cứng Camera AI**

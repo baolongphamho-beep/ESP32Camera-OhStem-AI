@@ -39,9 +39,18 @@ static void processFrame() {
   lastResult = millis();
   hasResult = true;
   Serial.printf("[Camera] label=%s confidence=%.1f%%\n", label.c_str(), confidence);
+  // Project 3: pedestrian_distance.py sends PED_WARN_D<m> / PED_SAFE_D<m>.
+  float pedDistance;
+  bool pedWarning;
+  if (decodePedestrianLabel(label.c_str(), pedDistance, pedWarning)) {
+    updatePedestrian(pedDistance, pedWarning);
+    Serial.printf("[Camera] Pedestrian %.2f m%s\n", pedDistance, pedWarning ? " WARNING" : "");
+    return;
+  }
   PersonStatus status;
   float heightCm, distanceM;
   if (decodeCameraLabel(label.c_str(), status, heightCm, distanceM)) {
+    if (status == PersonStatus::None) clearPedestrian();
     updateCameraMeasurement(status, heightCm, distanceM);
     if (status == PersonStatus::Measured) {
       Serial.printf("[Camera] Height=%.1f cm Distance=%.2f m\n", heightCm, distanceM);

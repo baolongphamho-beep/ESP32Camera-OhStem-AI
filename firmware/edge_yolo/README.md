@@ -1,116 +1,94 @@
-# SmartScale chạy YOLO26n trên YOLO UNO
+# SmartScale Plan 2 — YOLO26n trên YOLO UNO
 
-Firmware ESP-IDF riêng cho ESP32-S3 có **Flash 16 MB, PSRAM octal 8 MB**, đúng kết quả probe của bo hiện tại. AI, tính chiều cao và BMI đều chạy trên UNO. Camera OhStem cung cấp JPEG qua Wi-Fi; LCD nối I2C trực tiếp vào UNO. Laptop chỉ cấu hình và xem ảnh qua Type-C.
-
-**Đã kiểm tra trên bo COM9 ngày07/11/2026:** nạp thành công và xác minh hash; chạy suy luận với tensor0 mất711ms, còn4,876,212byte PSRAM và84,959byte internal RAM trước khi cấp JPEG buffer. Kết quả được bo gửi qua USB (`build/device_probe.json`). Chưa nhập Wi-Fi nên chưa kiểm tra ảnh người thật, bản tin cân và LCD trong firmware native này. Tốc độ711ms là self-test, không phải tốc độ toàn bộ pipeline ảnh.
-
-Bản sao lưu Flash16MB trước khi nạp ở `firmware/backups/yolo_uno_before_edge_20261107.bin` tính từ gốc repo, được bỏ qua bởi Git. Không công khai bản sao lưu vì có thể chứa cấu hình cũ.
+Mã nền được khôi phục từ nhánh `smartscale-edge-ai`, commit [`c2f71b6`](https://github.com/baolongphamho-beep/ESP32Camera-OhStem-AI/commit/c2f71b65c7e8e76567cf5d14f6b8240a50ab70a7), rồi tích hợp Plan 2 ngày 18/11/2026. Luồng: cân BLE → thức dậy → servo quét → khóa toàn thân → trung vị chiều cao → cân chốt/BMI → giữ kết quả → nghỉ.
 
 ```text
-OhStem /capture -- Wi-Fi JPEG --> YOLO UNO -- I2C --> LCD 16x2
-Mi Scale 2 -------- BLE ------->     |
-                                    +-- USB JPEG + kết quả --> laptop (tùy chọn)
+OhStem /capture ── Wi-Fi JPEG ──► YOLO UNO (YOLO26n + EdgeFsm)
+Mi Scale 2 ─────── BLE 0x181D ──►   ├── GPIO10 PWM ──► servo camera
+                                  ├── GPIO11/12 ──► LCD 16×2
+                                  └── USB SSV1 ──► usb_viewer.py (tùy chọn)
 ```
 
-Không chạy `camera/smartscale_camera.py` hoặc launcher cũ trong chế độ này. Không cần UART kết quả phân loại Face/No Face. Hai bo vẫn cần đường truyền ảnh Wi-Fi và nguồn điện riêng/phù hợp.
+**Đã thực hiện trên máy LAB ngày 18/11/2026:** Đã cài ESP-IDF 6.1 tại `C:\Espressif\v6.1\esp-idf`, tools/Python riêng tại `C:\Espressif`. Đã build/nạp native Plan 2 trên **COM5** và bổ sung chế độ `--preview` để thử riêng camera. Probe preview nhận **4 ảnh JPEG 640×480 trong 45 s**, YOLO xử lý khoảng 0,6 s/ảnh. Camera/mạng còn chậm và có lần truyền thiếu ảnh; ảnh thử tối/mờ, chưa kiểm chứng phát hiện người thật. Chưa thử cân và cơ khí servo toàn hệ thống. Xem [biên bản build/nạp](../../docs/reports/NATIVE_BUILD_FLASH_20261118.md).
 
-## Quy trình Setup chuẩn từ đầu (Đấu nối, Camera, Nạp Firmware & Chạy)
+## Phần cứng và cấu hình
 
-1. **Đấu nối mạch theo Netlist:**
-   - **LCD 16×2 I2C** cắm vào cổng I2C đỏ trên YOLO UNO: **`SDA = GPIO 11`**, **`SCL = GPIO 12`**, `VCC = 5V`, `GND = GND` (Firmware tự dò địa chỉ PCF8574 tại `0x20..0x27` và `0x38..0x3F`).
-   - **Camera AI OhStem**: cấp nguồn 5V qua cổng Type-C.
-   - **Cân Mi Scale 2**: lắp pin, phát quảng bá BLE service `0x181D` (MAC `70:87:9e:ea:3a:e0`).
-   - **YOLO UNO**: cắm cáp USB Type-C (có truyền dữ liệu) vào máy tính.
-2. **Vào chế độ `Stream video` trên Camera AI & Setup lại Wi-Fi cho Camera:**
-   - Bấm nút trên Camera AI mở menu màn hình OLED sau lưng camera, chọn mục **`6. Stream video`** (bắt buộc để mở endpoint `/capture`).
-   - Nếu camera chưa nối Wi-Fi (hoặc đổi Wi-Fi mới): kết nối điện thoại/laptop vào Wi-Fi do camera phát ra (`ohstemcam_...`), mở trình duyệt vào **`http://192.168.4.1`**, chọn mạng Wi-Fi 2.4 GHz và nhập mật khẩu.
-   - Khi kết nối thành công, màn hình OLED của camera sẽ hiện **địa chỉ IP** (ví dụ `10.127.7.68`). Đóng mọi tab trình duyệt đang mở trang camera để tránh lỗi `{"busy":1}`.
-3. **(Song song) Biên dịch và nạp Firmware xuống YOLO UNO:**
-   - Xem cổng COM của YOLO UNO trong Device Manager (ví dụ `COM13` hoặc `COM9`), sau đó chạy lệnh bên dưới.
-4. **Chạy chương trình kèm `--configure` rồi vận hành:**
-   - Chạy `python camera/usb_viewer.py --port COM13 --configure`, nhập SSID/Password Wi-Fi và IP camera rồi bắt đầu đo. Lần sau chỉ cần chạy `python camera/usb_viewer.py --port COM13`.
+- Native đang dùng partition **flash 16 MB**, PSRAM octal 8 MB theo baseline upstream. Xác minh bo thật trước khi nạp; board Arduino trong `boards/` vẫn cấu hình 8 MB.
+- Servo GPIO10 (D7), nguồn 5 V riêng ≥2 A, tụ 470–1000 µF, GND chung; LCD SDA=11/SCL=12. Thu hẹp hành trình bằng `servo_bottom`/`servo_top` sau hiệu chuẩn.
+- Camera giữ firmware gốc. Chọn `Stream video` trên camera để có `/capture`, nối cùng Wi-Fi 2,4 GHz với UNO. Đóng các tab/script khác đang lấy ảnh từ camera.
+- Cân phải luôn có pin. Lọc đúng MAC; decoder hỗ trợ quảng bá service `0x181D` với bit stable/load-removed. **Chưa có GATT fallback** nếu cân chỉ gửi số qua `2A9D`.
 
-## Biên dịch và nạp
+`EdgeDeviceConfig` kế thừa `EdgeConfig` dùng chung; `EdgeFsm` lấy trung vị 3 khung toàn thân và xử lý người rời cân, nhiều người, quá gần, mất ảnh, giữ kết quả. Các thông số servo, `height`, `focal`, MAC lưu trong NVS `edge_cfg`; cấu hình Arduino ở `sweep_cfg` không tự chuyển sang. Các khóa cũ `mode`, `distance`, `reference`, `tilt` không điều khiển native Plan 2: góc nghiêng lấy từ servo.
 
-Đã chuẩn bị model `models/yolo26n_224_s8_s3.espdl` (~3.08 MB), ESP-DL pinned revision `512ed0b0dc5f5320f3d9ca5a5aea189803f87f31`, cùng môi trường ESP-IDF 5.5.x (đã kiểm tra trên `v5.5.6`) chạy song song 2 nhân (Core 0: Wi-Fi HTTP `/capture` với `Connection: close` cho web server đơn kết nối của OhStem, BLE, USB, LCD; Core 1: `app_main` chạy suy luận YOLO26n).
+## Chuẩn bị và build
 
-Từ thư mục gốc project (4 chế độ build):
+Máy cần Git for Windows và **ESP-IDF 6.1** cùng toolchain do trình cài chính thức cung cấp. PlatformIO/Arduino hiện có không thay cho môi trường này. Script kiểm tra SDK, model và ESP-DL, báo rõ thành phần còn thiếu; không tự cài SDK hay xóa cache/build.
+
+Cài SDK bằng [EIM theo hướng dẫn Espressif](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/windows-setup.html), chọn v6.1/ESP32-S3, rồi ghi lại đường dẫn thật cho `-IDFPath`. `pip install` không cài ESP-IDF. [Đường dẫn dự án và SDK không được chứa dấu cách](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/windows-start-project.html#start-a-project); với thư mục LAB chứa `Mira's Laptop`, `build.ps1` hiện tự đồng bộ các file cần thiết sang `C:\esp\SmartScale` bằng `tools/stage_build.ps1`. Vẫn chạy lệnh tại gốc dự án LAB; không cần tự chuyển mã nguồn hoặc sửa file trong bản sao build.
+
+Từ gốc dự án:
 
 ```powershell
-# 1. Chế độ tích hợp mặc định (bước lên cân > 5 kg mới đánh thức camera & AI; bước xuống tự về STANDBY 80 MHz, BLE 10%, LCD OFF):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash -Port COM16
-
-# 2. Chế độ Camera + AI + cân chạy liên tục (dùng khi test/hiệu chuẩn camera mà chưa bước lên cân):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -CameraContinuous -Flash -Port COM16
-
-# 3. Chế độ chỉ test cân BLE + LCD + Power telemetry (không chạy camera/AI):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ScaleOnly -Flash -Port COM16
-
-# 4. Chế độ test độc lập trục Servo PWM trên bàn lab (nhận lệnh USB Serial: SERVO <deg>, SERVO SWEEP, SERVO DETACH):
-powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ServoTest -Flash -Port COM16
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/tools/fetch_model.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1
+# Sau khi build thành công, nạp UNO (tự tìm cổng Espressif; nhiều bo thì thêm -Port COMx):
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -Flash
 ```
 
-Có thể bỏ `-Flash -Port COM16` nếu chỉ muốn biên dịch kiểm tra (mặc định `-StandbyScanPercent 10`, có thể truyền `25`, `50`, `100` nếu muốn đo riêng). Với `-ServoTest`, chạy `python camera/servo_bench.py --port COM16` (hoặc dùng venv `D:\PROJECT\.venv\Scripts\python.exe`) và gửi `help`, `90`, `sweep`, `detach`, `set servo_level=90 servo_dir=1` để căn góc ngang và kiểm tra sụt áp trước khi ghép FSM ở Phase 3. Để theo dõi riêng trạng thái nguồn/CPU/BLE/LCD (`STANDBY` / `ACTIVE` / `DRAINING` / `RESULT_HOLD`), đóng `usb_viewer.py` và chạy `python camera/power_monitor.py --port COM16`. Xem chi tiết tại `docs/CAMERA_POWER_INTEGRATION.md`.
+Nếu bản sao build thiếu ESP-DL, `build.ps1` gọi `prepare_sources.ps1 -DestinationRoot <build root> -SkipDataset` để tải đúng nguồn, không tải COCO8 khi chỉ cần build. Chạy riêng `prepare_sources.ps1` để chuẩn bị thêm dataset cho lượng tử hóa. `prepare_sources.ps1` tải ESP-DL pinned `512ed0b0dc5f5320f3d9ca5a5aea189803f87f31` vào `.edge-deps/esp-dl` và COCO8 để tái lượng tử hóa. `fetch_model.ps1` lấy đúng model upstream và xác minh SHA256 `76699d828b929755efc8b854a7cf313fd287a6e0d7ca21fbc82c998688b8955a`; model đã có trên máy này. Muốn tự xuất model, dùng `tools/quantize.py` và `tools/requirements.txt`. Model COCO8 chỉ dùng bring-up; độ chính xác cần kiểm định bằng ảnh thật.
 
-Lệnh thứ hai thay chương trình trên UNO bằng firmware này, có ghi bootloader/bảng phân vùng mới. Script không tự xóa NVS. Firmware Arduino/PlatformIO vẫn nằm nguyên trong project và có thể nạp lại bằng environment cũ.
+Khi đổi sdkconfig cũ, dùng menuconfig áp dụng `sdkconfig.defaults`: CPU tối đa 240 MHz, task chính Core 1, TCP window 32 KB, PM enable. Không tự xóa sdkconfig cá nhân. HTTP worker ở Core 0; capture gate chỉ cho lấy ảnh sau servo settle và bỏ ảnh cũ khi góc/config/phiên đo đổi. Không prefetch ảnh qua một lần đổi góc.
 
-Các file sau biên dịch ở `build/`: `smartscale_edge_yolo.bin`, `bootloader/bootloader.bin`, `partition_table/partition-table.bin`. Không nạp riêng app `.bin` vào địa chỉ 0; dùng script để đúng địa chỉ. File model đã được nhúng vào app.
+Sau khi build thành công và xác nhận bo 16 MB, nạp **YOLO UNO** bằng `build.ps1 -IDFPath <đường dẫn> -Flash -Port COMx`. Không nạp camera. Trở về bản Arduino bằng upload env `yolo_uno_servo_sweep`.
 
-`.edge-deps`, môi trường Python và các model sinh ra không đưa vào Git. Khi clone trên máy mới cần chuẩn bị lại dependencies/model; xem phần tái tạo bên dưới.
+## Cấu hình và vận hành
 
-## Nhập cấu hình và xem ảnh
-
-Đã cài dependencies USB viewer trong `.venv-camera` trên máy này. Máy mới có thể tạo venv rồi cài `camera/requirements-usb.txt`.
+### Chỉ thử UNO và camera (chưa có cân/servo)
 
 ```powershell
-.\.venv-camera\Scripts\python.exe camera/usb_viewer.py --port COM9 --configure
+.\.venv-camera\Scripts\python.exe camera\usb_viewer.py --preview
 ```
 
-Nhập SSID, mật khẩu Wi-Fi (hiện khi nhập; bỏ trống nếu mạng Wi-Fi mở), URL ảnh thật của camera như `http://10.127.7.68/capture`, MAC cân Mi Scale 2 (mặc định `70:87:9e:ea:3a:e0`, nhập `00:00:00:00:00:00` nếu muốn tắt lọc MAC), thông số lắp đặt và thời gian giữ kết quả trên LCD (`hold_sec`: mặc định **`10` giây**, dải `0..60`, `0 = tắt`). Wi-Fi được lưu trong NVS của UNO, không ghi mật khẩu ra log hoặc file trong repo. IP mặc định chỉ là giá trị ban đầu, phải thay nếu camera đổi IP. Khi chạy, firmware tự động cấu hình camera về `QVGA (320×240)` và giữ đèn nền LCD tắt ở `STANDBY`, bật sáng khi `ACTIVE` / `RESULT_HOLD`.
+`--preview` bật pha `CAMERA_TEST` tạm thời: UNO lấy JPEG và chạy YOLO mà không chờ người bước lên cân; không gắn hay quay servo, tạm dừng BLE scan, không tính H/W/BMI. Chỉ cần Wi-Fi UNO và URL camera đã cấu hình đúng. Nhấn **Q** để dừng preview; firmware trở về Plan 2. Nếu chương trình đóng đột ngột/mất USB, lease hết hạn sau 10 s và tự khôi phục Plan 2. Chế độ thử không lưu trong NVS. Chỉ mở một viewer trên COM5.
 
-- **fixed**: camera đặt ngang, biết khoảng cách tới vị trí đứng. Nhập khoảng cách (m), chiều cao thật người chuẩn (cm). Nhập `fy/H = 0` để hiệu chuẩn tự động khi có **3 frame toàn thân liên tiếp ổn định** (độ lệch chiều cao box ≤ 5%). Người đầu tiên đứng yên trong khung phải chính là người chuẩn, đứng thẳng và thấy cả đỉnh đầu lẫn bàn chân. Sau đó UNO lưu tiêu cự vào NVS để đo người tiếp theo ở cùng vị trí.
-- **ground**: nhập độ cao tâm camera tính từ **mặt trên bàn cân**, góc nghiêng xuống (độ) và `fy/H` đã hiệu chuẩn. Khoảng cách được tính từ tia chiếu chân cắt mặt phẳng bàn cân. `fy/H` bắt buộc khác 0.
-- `fy/H` là tiêu cự theo pixel chia chiều cao ảnh. Ví dụ fy=600px trên ảnh cao480px thì nhập1.25. **Không nhập tiêu cự 3.6mm.** Chuẩn hóa này chỉ giữ đúng khi cùng góc nhìn và tỷ lệ ảnh; đổi crop, xoay, zoom hoặc lens thì hiệu chuẩn lại.
-- Ở `fixed`, khoảng cách là thông số đã nhập, không phải một phép đo độc lập. Từ một box đơn lẻ không thể suy ra đồng thời chiều cao và khoảng cách khi thiếu thông tin chuẩn.
+Đổi URL camera mà không nhập lại hình học/servo: thêm `--set camera=http://<IP-camera>/capture` cùng `--preview`. Native mới hỗ trợ lệnh USB `PREVIEW ON`/`PREVIEW OFF`; viewer duy trì heartbeat mỗi 3 s.
 
-Cấu hình lưu trong UNO. Lần sau chỉ xem:
+### Cấu hình và đo đầy đủ theo Plan 2
+
+**Bản nhanh hiện đang nạp:** input 192×192, hai nhân, cache line 64 byte và ưu tiên tối đa 32 KiB SRAM cho model (có fallback về PSRAM). Camera đã đổi qua API cảm biến sang QVGA 320×240, quality giữ 15; không nạp firmware camera. Probe đầu 5 ảnh: xử lý 320–327 ms, trung vị 324 ms; riêng model 299–306 ms. HTTP ở lần này chậm 2.996–11.748 ms, nên tổng độ trễ vẫn phụ thuộc Wi-Fi. Viewer cuối đã nhận ảnh 325 ms và phát hiện người; chưa đánh giá độ chính xác theo bộ dữ liệu hay sai số chiều cao. Input nhỏ và ảnh QVGA giảm chi tiết người ở xa. Model 160 chưa xuất vì 192 đã vào khoảng 300 ms. Chi tiết trong [biên bản đo](../../docs/reports/NATIVE_BUILD_FLASH_20261118.md).
 
 ```powershell
-.\.venv-camera\Scripts\python.exe camera/usb_viewer.py --port COM9
+# Giữ bản 192 khi build/nạp lại trên máy LAB (model đã có và kiểm hash)
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ModelSize 192 -Flash
+
+# Quay về model 224 còn được giữ nguyên
+powershell -NoProfile -ExecutionPolicy Bypass -File firmware/edge_yolo/build.ps1 -ModelSize 224 -Flash
 ```
 
-Nhấn Q hoặc Esc để đóng. Laptop không tải/chạy model. Sau cấu hình, UNO hoạt động với nguồn USB/nguồn phù hợp mà không cần laptop chạy viewer. Lưu ý nguồn qua cổng USB laptop sẽ mất nếu rút cáp, nên cần cấp nguồn khác để chạy độc lập.
+`build.ps1` và `main/CMakeLists.txt` mặc định **192** từ 22/11 (khớp bản đang nạp); máy chưa có model 192 thì truyền `-ModelSize 224`. CMake và mã đổi tọa độ dùng chung `EDGE_MODEL_INPUT`, tránh dùng nhầm tỷ lệ 224 cho model 192. Thay đổi cache trong `sdkconfig.defaults` áp dụng cho build mới; build LAB hiện tại đã cập nhật và xác minh `CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE=64`. Model 192 chưa có URL tải công khai: cần xuất bằng `tools/quantize.py --size 192` trong môi trường ở `tools/requirements.txt`, hoặc dùng artifact đã xác minh trên máy này. Với đường dẫn có dấu nháy như `Mira's Laptop`, chạy script/weights/dataset ở cây stage `C:\esp\SmartScale` vì Ultralytics có bước loại dấu nháy trong đường dẫn weights; không đổi tên thư mục người dùng.
 
-## LCD và trạng thái dữ liệu
+Thứ tự thao tác theo hai dấu ✓ trong ảnh ghi chú: **Reset/setup Wi-Fi camera → chạy configure và nhập thông số**. Xem [workflow chi tiết và bảng thông số](../../docs/WORKFLOW_WIFI_CONFIGURE.md).
 
-- Không có người: hai dòng `No people` / `detected`.
-- Một người đủ khung và có hiệu chuẩn: dùng bộ lọc trung vị 5 khung hình cho chiều cao/khoảng cách, luân phiên `H:...cm`, `W:...kg LOCK` với `D:...m`, `BMI:...`.
-- Cân chưa chốt: W vẫn cập nhật 2 chữ số thập phân, có `...`; BMI đợi bit ổn định của cân. Khi thiếu khung/chưa hiệu chuẩn (`Partial` / `NeedsCalibration`), LCD vẫn luân phiên hiển thị cân nặng `W:...`.
-- Giữ kết quả (`ResultHold`): sau khi chốt đủ H + W `LOCK` + BMI, khi người dùng bước xuống khỏi cân (`load_removed`) hoặc rời khung hình, kết quả tiếp tục được giữ nguyên trên LCD sáng liền mạch thêm **`10` giây** mặc định (cấu hình `0..60s` qua `hold_sec`: `D:...m HOLD` / `BMI:...`) trước khi tắt đèn nền về `STANDBY` (tự xóa sớm nếu có người mới đứng lên cân hoặc có nhiều người).
-- Nhiều người: yêu cầu một người mỗi lần. Box chạm biên ảnh bị từ chối vì có thể thiếu đầu/chân. Rớt 1–2 khung hình YOLO thoáng qua không làm xóa cân nặng đang đo.
-- Wi-Fi/camera mất kết nối quá 3 lần thử: LCD báo lỗi kết nối thay vì giữ số đo trước.
-- Dữ liệu camera hết hạn sau 10 giây, cân sau 30 giây. BMI chỉ có khi chiều cao mới hợp lệ và cân đã chốt. USB viewer không giữ ảnh cũ khi có thông báo camera offline.
-
-Nhận diện bằng bounding box **không bảo đảm** đỉnh hộp trùng đỉnh đầu và đáy hộp trùng chân. Chiều cao là ước lượng, cần đối chiếu thước thật với nhiều người sau khi cố định camera. Input224 và lượng tử hóa có thể giảm khả năng phát hiện người ở xa.
-
-## Tái tạo model
-
-Các script ở `tools/` thực hiện export theo tutorial Espressif, cần Python 3.11, môi trường `.venv-edge`, PyTorch CPU và `firmware/edge_yolo/tools/requirements.txt`. Chạy `tools/prepare_sources.ps1` để tải ESP-DL runtime (pinned revision) và bộ COCO8 train về `.edge-deps/`, đảm bảo có model gốc `yolo26n.pt` ở gốc repo, rồi:
+Cài thư viện USB viewer vào đúng môi trường trước lần chạy đầu (đặc biệt `pyserial`, được import dưới tên `serial`):
 
 ```powershell
-.\.venv-edge\Scripts\python.exe firmware/edge_yolo/tools/quantize.py --size 224
+.\.venv-camera\Scripts\python.exe -m pip install -r camera\requirements-usb.txt
 ```
 
-Đây là bản bring-up: calibration COCO8, 8 bước calibration và 8 bước TQT. File `.build.json` lưu kích thước, SHA256, revision và **accuracy_validated=false**. Chưa được coi là mô hình đã kiểm định độ chính xác chiều cao. Không chạy lượng tử hóa trên bo; chỉ firmware suy luận chạy trên bo.
+```powershell
+.\.venv-camera\Scripts\python.exe camera\usb_viewer.py --configure
+```
 
-## Kiểm tra và chẩn đoán
+Nhập Wi-Fi, URL `http://<IP-camera>/capture`, MAC cân; chọn **servo** cho hình học, đặt độ cao ống kính trên mặt cân (`height`, cm), `focal = fy / H` (không phải mm), và các khóa servo. Khuyến nghị cự ly 2,8–3,2 m, độ cao camera 1,0–1,2 m. Xem [hướng dẫn hiệu chuẩn](../../docs/HUONG_DAN_PLAN2.md).
 
-Khi khởi động, UNO chạy một lần suy luận với tensor 0 để kiểm tra cấp phát và đường chạy mô hình, trước khi chờ Wi-Fi. USB viewer nhận bản tin `boot` nếu đã kết nối lúc đó; phép thử này không phải kiểm tra độ chính xác nhận diện.
+```powershell
+.\.venv-camera\Scripts\python.exe camera\usb_viewer.py --set servo_bottom=65 --set servo_top=115 --set servo_level=90 --set servo_dir=1 --set servo_settle=400 --set hold_sec=12
+```
 
-- `WiFi not ready`: chạy lại viewer `--configure`, kiểm tra Wi-Fi2.4GHz.
-- `Camera capture failed`: kiểm tra URL/IP, camera đang bật và hai bo cùng mạng có thể truy cập; giảm độ phân giải.
-- `Model allocation failed`/`JPEG allocation failed`: chụp lại thông báo, cần điều chỉnh kích thước model/bộ nhớ, không dùng kết quả đo.
-- COM9 Access denied: đóng monitor, viewer và ứng dụng khác đang giữ cổng.
-- Có chiều cao nhưng không có W: đánh thức cân, đứng lên, kiểm tra MAC và bản tin quảng bá0x181D. Không có BMI cho tới khi W chốt.
+APPLY không hợp lệ không thay cấu hình RAM. APPLY thành công lưu NVS, bỏ khung ảnh đang xử lý và bắt đầu phiên đo mới; thay MAC có hiệu lực khi quét, không cần reboot. Native gửi JPEG và JSON SSV1 CRC32 với `phase`, `servo_deg`, `tilt_deg`, `framing`, `margin_px`, H/W/D/BMI. Chỉ chạy USB viewer trên laptop, không chạy `body_tracker.py` hoặc `smartscale_camera.py` cùng lúc.
 
-Giao thức USB dùng header `SSV1`, độ dài JSON/JPEG và CRC32, cho phép đồng bộ lại khi đọc thiếu byte. UART0 dành log kỹ thuật; cổng USB dùng viewer nhị phân, không dùng Serial Monitor để xem ảnh.
+## Chế độ nghỉ và việc cần đo thật
+
+Ở STANDBY: LCD tắt nền, servo nhả PWM, không yêu cầu `/capture`, không suy luận; BLE quét thụ động 20 ms/200 ms (~10%), Wi-Fi modem power save, CPU cho phép DFS 80–240 MHz. Lúc hoạt động giữ CPU ở 240 MHz, BLE 50 ms/100 ms. Không dừng BLE trong lúc HTTP để tránh mất gói bước xuống. Có một self-test model khi khởi động; automatic light sleep chưa bật để giữ USB/BLE hoạt động.
+
+Phải đo dòng, độ trễ thức dậy, brownout, cơ khí/độ lặp góc và sai số 3–5 người, sau đó chạy 20–30 lượt theo [QA checklist](../../docs/QA_CHECKLIST.md). Khi không nhận load-removed, presence hết hạn theo TTL cân 30 s; không cam kết phát hiện bước xuống trong 2 s nếu cân không gửi gói đó. Driver hiện đi theo các bước FSM, chưa có ramp nội suy riêng cho hành trình homing; kiểm tra độ êm trên gá thật trước demo. Bản này chưa đạt toàn bộ DoD phần cứng của Plan 2.

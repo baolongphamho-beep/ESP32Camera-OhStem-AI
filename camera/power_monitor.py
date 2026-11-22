@@ -1,9 +1,23 @@
-"""Read scale/power telemetry over SSV1 without OpenCV or a camera."""
+"""Read scale/power telemetry over SSV1 without OpenCV or a camera.
+
+Merged on branch feat/ui-viewer-qa (TV5, 22/11): the smartscale-edge-ai version
+(telemetry_change_key, format_telemetry_line, open_serial_no_reset) plus the TV5
+additions (--port auto, --log metadata-only JSONL, finite --seconds check).
+"""
 import argparse
+import math
 import time
 
+from serial_port import add_port_argument, port_or_exit
+from telemetry import PacketRecorder
 from usb_protocol import Parser
-from usb_viewer import format_metric
+
+
+def format_metric(value, unit="", fmt=".1f"):
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "--"
+    formatted = format(value, fmt)
+    return f"{formatted} {unit}" if unit else formatted
 
 
 def open_serial_no_reset(name):
@@ -62,22 +76,25 @@ def main():
     import serial
 
     args_parser = argparse.ArgumentParser(description=__doc__)
-    args_parser.add_argument("--port", required=True)
+    add_port_argument(args_parser)
     args_parser.add_argument("--seconds", type=float, default=0,
                              help="stop after N seconds; 0 means until Ctrl+C")
+    args_parser.add_argument("--log", help="Append image-free metadata QA JSONL")
     args = args_parser.parse_args()
-    if args.seconds < 0:
+    if not math.isfinite(args.seconds) or args.seconds < 0:
         args_parser.error("--seconds must be nonnegative")
+    args.port = port_or_exit(args.port)
 
     parser = Parser()
     previous = None
     received = 0
     try:
-        with open_serial_no_reset(args.port) as port:
+        with PacketRecorder(args.log) as recorder, open_serial_no_reset(args.port) as port:
             started = time.monotonic()
             print("Reading power telemetry; Ctrl+C stops this monitor only.", flush=True)
             while not args.seconds or time.monotonic() - started < args.seconds:
                 for meta, _ in parser.feed(port.read(4096)):
+                    recorder.write(meta)
                     if meta.get("kind") != "scale":
                         continue
                     received += 1
@@ -92,7 +109,8 @@ def main():
         print(f"Serial error: {exc}")
         return 1
     if not received:
-        print("No scale telemetry. Check port and flash the firmware.")
+        print("No kind=scale telemetry. Check port and firmware compatibility.")
+        print("The Plan 2 servo firmware sends kind=status; this monitor needs TV2 scale telemetry.")
         return 1
     return 0
 

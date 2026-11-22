@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 
 from geometry import calibrate_focal, fixed_distance_height, ground_plane_height, measurement_label
-from protocol import serial_control_url
+from protocol import serial_control_url, ultralytics_model_path
 
 DIRECTORY = Path(__file__).resolve().parent
 
@@ -64,15 +64,10 @@ def resolve_focal(settings, calibration, resolution, pixel_height):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ip", required=True, help="Camera IP on same Wi-Fi")
-    local_model = DIRECTORY.parent / "yolo26n.pt"
-    repository_model = DIRECTORY.parent.parent / "yolo26n.pt"
-    sibling_model = DIRECTORY.parent.parent / "ESP32Camera-OhStem-AI/yolo26n.pt"
-    if local_model.is_file():
-        default_model = local_model
-    elif repository_model.is_file():
-        default_model = repository_model
-    else:
-        default_model = sibling_model
+    # Combined repo: yolo26n.pt sits at the repository root, next to platformio.ini.
+    model_candidates = [DIRECTORY.parent / "yolo26n.pt", DIRECTORY.parent.parent / "yolo26n.pt",
+                        DIRECTORY.parent.parent / "ESP32Camera-OhStem-AI/yolo26n.pt"]
+    default_model = next((path for path in model_candidates if path.is_file()), model_candidates[0])
     parser.add_argument("--model", type=Path, default=default_model)
     parser.add_argument("--settings", type=Path, default=DIRECTORY / "settings.json")
     parser.add_argument("--calibration", type=Path, default=DIRECTORY / "calibration.json")
@@ -123,7 +118,7 @@ def main():
     from ultralytics import YOLO
 
     calibration = {} if args.recalibrate else read_json(args.calibration)
-    model = YOLO(str(args.model))
+    model = YOLO(ultralytics_model_path(args.model))
     base = "http://" + args.ip.strip().removeprefix("http://").rstrip("/")
     session = requests.Session()
     last_send = 0.0

@@ -4,8 +4,14 @@
 #include "measurements.h"
 
 static const char* lcdStatus = "disabled";
+static char sweepLines[2][17] = {"Standby", "Step on scale"};
+static bool backlightOn = true;
 
 const char* displayStatus() { return lcdStatus; }
+void setDisplayLines(const char* line0, const char* line1) {
+    snprintf(sweepLines[0], sizeof(sweepLines[0]), "%s", line0 ? line0 : "");
+    snprintf(sweepLines[1], sizeof(sweepLines[1]), "%s", line1 ? line1 : "");
+}
 
 #if LCD_ENABLED
 #include <Wire.h>
@@ -23,6 +29,21 @@ static uint32_t lastLcdAttempt = 0;
 static bool pinsAvailable(int sda, int scl) {
 #if CAMERA_ENABLED
     if (sda == CAMERA_RX_PIN || sda == CAMERA_TX_PIN || scl == CAMERA_RX_PIN || scl == CAMERA_TX_PIN) return false;
+#endif
+#ifdef HEIGHT_SERVO_BMI_MODE
+    // Servo-mode camera UART and servo pins (see lib/HeightCamera/height_config.h).
+    const int reserved[] = {HEIGHT_CAMERA_RX_PIN, HEIGHT_CAMERA_TX_PIN, HEIGHT_SERVO_PIN, SCALE_POWER_PIN};
+    for (int pin : reserved) {
+        if (sda == pin || scl == pin) return false;
+    }
+#endif
+#ifdef SERVO_SWEEP_MODE
+    // Servo-sweep camera UART and servo pins (see lib/Config/config.h). The servo pin
+    // can change at runtime (servo_pin); auto-detect never probes the default one.
+    const int sweepReserved[] = {SWEEP_CAMERA_RX_PIN, SWEEP_CAMERA_TX_PIN, SWEEP_SERVO_PIN};
+    for (int pin : sweepReserved) {
+        if (sda == pin || scl == pin) return false;
+    }
 #endif
 #if SCALE_ENABLE_FORCE
     // Only the standard I2C pair is reserved when force sensors are enabled.
@@ -93,7 +114,8 @@ void initDisplay() {
         if (!candidate) continue;
         lcd = new LiquidCrystal_I2C(candidate, 16, 2);
         lcd->init(); // Wire.begin() inside the library reuses the selected pins.
-        lcd->backlight();
+        if (backlightOn) lcd->backlight();
+        else lcd->noBacklight();
         lcdStatus = "ready";
         Serial.printf("[LCD] Address=0x%02x SDA=%d SCL=%d\n", candidate, sda, scl);
         lcdLine(0, "No people");
@@ -108,6 +130,17 @@ void initDisplay() {
 #endif
 }
 
+void setDisplayBacklight(bool on) {
+    if (on == backlightOn) return;
+    backlightOn = on;
+#if LCD_ENABLED
+    if (lcd) {
+        if (on) lcd->backlight();
+        else lcd->noBacklight();
+    }
+#endif
+}
+
 void updateDisplay() {
 #if LCD_ENABLED
     if (!lcd) {
@@ -118,6 +151,32 @@ void updateDisplay() {
     if (millis() - updated < 200) return;
     updated = millis();
     const MeasurementView view = measurementView();
+#ifdef HEIGHT_SERVO_BMI_MODE
+    // Row 0: "H:170.2 W:65.3"   Row 1: "BMI:22.5" or what is still missing.
+    lcdLine(0, (view.hasHeight ? "H:" + String(view.heightCm, 1) : String("H:--")) + " " +
+               (view.hasWeight ? "W:" + String(view.weightKg, 1) : String("W:--")));
+    if (view.hasBMI) lcdLine(1, "BMI:" + String(view.bmi, 1));
+    else if (!view.hasHeight) lcdLine(1, "BMI:-- do height");
+    else if (!view.hasWeight) lcdLine(1, "BMI:-- step on");
+    else lcdLine(1, "BMI:-- wait lock");
+    return;
+#endif
+#ifdef SERVO_SWEEP_MODE
+    // Text comes from lib/EdgeSweep/edge_io.h via setDisplayLines(); a row is
+    // only rewritten when it changes (lcdLine compares with the previous text).
+    (void)view;
+    lcdLine(0, sweepLines[0]);
+    lcdLine(1, sweepLines[1]);
+    return;
+#endif
+    // Project 3: fresh pedestrian data takes the screen; it expires after
+    // PEDESTRIAN_TTL_MS, then the normal screens come back.
+    const PedestrianView ped = pedestrianView();
+    if (ped.active) {
+        lcdLine(0, "Pedestrian " + String(ped.distanceM, ped.distanceM < 10 ? 2 : 1) + "m");
+        lcdLine(1, ped.warning ? "!! TOO CLOSE !!" : "Safe distance");
+        return;
+    }
     if (view.status == PersonStatus::None) {
         lcdLine(0, "No people");
         lcdLine(1, "detected");

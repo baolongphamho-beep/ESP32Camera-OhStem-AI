@@ -53,4 +53,8 @@ void reconnectDevicesService();
 
 void runScaleService(void *pvParameters);
 const char* scaleServiceStatus();
+// Scale MAC "AA:BB:CC:DD:EE:FF" (default SCALE_MAC). Call setScaleMac() before
+// runScaleService() starts; the scan task reads it without a lock.
+void setScaleMac(const char* mac);
+const char* scaleMac();
 #endif

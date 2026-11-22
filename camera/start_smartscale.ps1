@@ -10,24 +10,18 @@ param(
     [switch]$Recalibrate
 )
 $ErrorActionPreference = 'Stop'
-# Works from this camera/ directory or a copy in ESP32Camera-OhStem-AI.
+# Combined repo: camera/ sits next to platformio.ini in ESP32Camera-OhStem-AI-main.
 $parentDirectory = Split-Path -Parent $PSScriptRoot
 if (Test-Path -LiteralPath (Join-Path $parentDirectory 'platformio.ini')) {
     $scaleProject = $parentDirectory
 } else {
     $scaleProject = Join-Path $parentDirectory 'NimBLE_SmartScale_Cp'
 }
-$rootProjectDir = Split-Path -Parent (Split-Path -Parent $scaleProject)
-$rootVenvPython = Join-Path $rootProjectDir '.venv/Scripts/python.exe'
-$localVenvPython = Join-Path $scaleProject '.venv-camera/Scripts/python.exe'
-if (Test-Path -LiteralPath $rootVenvPython) {
-    $pythonExecutable = $rootVenvPython
-} elseif (Test-Path -LiteralPath $localVenvPython) {
-    $pythonExecutable = $localVenvPython
-} else {
-    throw "Missing Python virtual environment at $rootVenvPython. Follow camera/README.md to install dependencies."
-}
+$pythonExecutable = Join-Path $scaleProject '.venv-camera/Scripts/python.exe'
 $cameraScript = Join-Path $scaleProject 'camera/smartscale_camera.py'
+if (!(Test-Path -LiteralPath $pythonExecutable)) {
+    throw 'Missing .venv-camera. Follow camera/README.md to install dependencies.'
+}
 $cameraArguments = @($cameraScript, '--ip', $CameraIP, '--send-uart')
 $argumentMap = @{ReferenceCm='--reference-cm'; DistanceM='--distance-m'; FocalPx='--focal-px'; CameraHeightCm='--camera-height-cm'; TiltDeg='--tilt-deg'; Mode='--mode'}
 foreach ($key in $argumentMap.Keys) {
