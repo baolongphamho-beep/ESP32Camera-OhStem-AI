@@ -7,7 +7,7 @@ param(
     [switch]$CameraContinuous,
     [switch]$ServoTest,
     [ValidateSet(10, 25, 50, 100)]
-    [int]$StandbyScanPercent = 10
+    [int]$StandbyScanPercent = 100
 )
 $ErrorActionPreference = 'Stop'
 $modeCount = @($ScaleOnly, $CameraContinuous, $ServoTest) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
